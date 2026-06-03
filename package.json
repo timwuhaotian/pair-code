@@ -1,0 +1,56 @@
+{
+  "name": "pair-code",
+  "version": "0.1.0",
+  "description": "AI-powered pair coding harness — two agents collaborate on your code in the terminal",
+  "type": "module",
+  "license": "Apache-2.0",
+  "keywords": [
+    "ai",
+    "pair-programming",
+    "cli",
+    "coding-agent",
+    "dual-agent",
+    "code-review",
+    "automation"
+  ],
+  "author": {
+    "name": "timwuhaotian",
+    "url": "https://github.com/timwuhaotian"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/timwuhaotian/pair-code.git"
+  },
+  "bin": {
+    "pair-code": "./dist/index.js",
+    "pair": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start": "tsup && node dist/index.js",
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "log-update": "^6.1.0",
+    "string-width": "^7.2.0",
+    "strip-ansi": "^7.1.0",
+    "wrap-ansi": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "eslint": "^9.39.4",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.59.4"
+  }
+}
