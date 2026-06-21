@@ -32,16 +32,18 @@ export function createPairState(input: CreatePairInput): PairState {
     maxIterations: input.maxIterations ?? 20,
     turn: 'mentor',
     mentor: {
-      provider: input.mentor.provider,
+      profileName: input.mentor.profileName,
+      baseUrl: input.mentor.baseUrl,
       model: input.mentor.model,
       reasoningEffort: input.mentor.reasoningEffort,
-      activity: idleActivity('Mentor idle'),
+      activity: idleActivity('idle'),
     },
     executor: {
-      provider: input.executor.provider,
+      profileName: input.executor.profileName,
+      baseUrl: input.executor.baseUrl,
       model: input.executor.model,
       reasoningEffort: input.executor.reasoningEffort,
-      activity: idleActivity('Executor idle'),
+      activity: idleActivity('idle'),
     },
     messages: [],
     modifiedFiles: [],
@@ -81,18 +83,18 @@ export function prepareRun(state: PairState, role: AgentRole): PairState {
     if (isPlanningTurn) {
       s.iteration = 1;
       s.status = 'mentoring';
-      s.mentor = { ...s.mentor, activity: { phase: 'thinking', label: 'Analyzing task', detail: 'Preparing first instruction', startedAt: nowMs(), updatedAt: nowMs() } };
-      s.executor = { ...s.executor, activity: { phase: 'waiting', label: 'Executor standing by', startedAt: nowMs(), updatedAt: nowMs() } };
+      s.mentor = { ...s.mentor, activity: { phase: 'thinking', label: 'analyzing task', detail: 'Preparing first instruction', startedAt: nowMs(), updatedAt: nowMs() } };
+      s.executor = { ...s.executor, activity: { phase: 'waiting', label: 'standing by', startedAt: nowMs(), updatedAt: nowMs() } };
     } else {
       s.iteration = s.iteration + 1;
       s.status = 'reviewing';
-      s.mentor = { ...s.mentor, activity: { phase: 'thinking', label: 'Reviewing changes', detail: 'Checking the work', startedAt: nowMs(), updatedAt: nowMs() } };
-      s.executor = { ...s.executor, activity: { phase: 'waiting', label: 'Executor standing by', detail: 'Paused for review', startedAt: nowMs(), updatedAt: nowMs() } };
+      s.mentor = { ...s.mentor, activity: { phase: 'thinking', label: 'reviewing changes', detail: 'Checking the work', startedAt: nowMs(), updatedAt: nowMs() } };
+      s.executor = { ...s.executor, activity: { phase: 'waiting', label: 'awaiting review', detail: 'Paused for review', startedAt: nowMs(), updatedAt: nowMs() } };
     }
   } else {
     s.status = 'executing';
-    s.mentor = { ...s.mentor, activity: { phase: 'waiting', label: 'Mentor observing', startedAt: nowMs(), updatedAt: nowMs() } };
-    s.executor = { ...s.executor, activity: { phase: 'thinking', label: 'Executing plan', detail: 'Processing instructions', startedAt: nowMs(), updatedAt: nowMs() } };
+    s.mentor = { ...s.mentor, activity: { phase: 'waiting', label: 'observing', startedAt: nowMs(), updatedAt: nowMs() } };
+    s.executor = { ...s.executor, activity: { phase: 'thinking', label: 'executing plan', detail: 'Processing instructions', startedAt: nowMs(), updatedAt: nowMs() } };
   }
 
   s.turn = role;
@@ -104,7 +106,7 @@ export function setPairStatus(state: PairState, status: PairStatus, detail?: str
   if (status === 'finished') {
     s.finishedAt = nowMs();
     s.mentor = { ...s.mentor, activity: idleActivity('Mission finished') };
-    s.executor = { ...s.executor, activity: idleActivity('Executor idle') };
+    s.executor = { ...s.executor, activity: idleActivity('idle') };
   } else if (status === 'paused') {
     s.mentor = { ...s.mentor, activity: idleActivity('Paused') };
     s.executor = { ...s.executor, activity: idleActivity('Paused') };

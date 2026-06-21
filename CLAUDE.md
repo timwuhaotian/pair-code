@@ -4,62 +4,79 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`pair-code` is a CLI harness that orchestrates two AI coding agents in a loop: a **Mentor** (plans, reviews) and an **Executor** (writes code). It does **not** import the Anthropic SDK or any LLM client library — it shells out to installed agent CLIs (`claude`, `opencode`, `codex`, `gemini`) and parses their JSON stream output. Treat the local CLI binaries as the runtime, not the network.
+`pair-code` is a CLI harness that orchestrates two AI coding agents in a loop: a **Mentor** (plans, reviews) and an **Executor** (writes code). It drives both agents through the **Claude Agent SDK** (`@anthropic-ai/claude-agent-sdk`) in-process — it spawns one `query()` per turn rather than shelling out to installed agent CLIs. Each role binds to an **Anthropic-compatible endpoint** (base URL + key) declared in the environment, so any provider exposing that protocol (DeepSeek, GLM/Zhipu, Kimi, Qwen, MiniMax, OpenRouter, a LiteLLM gateway, or the official Anthropic API) can drive either role.
+
+The terminal UI is built with **Ink** (React for CLIs).
 
 ## Commands
 
 ```bash
-npm run build      # tsup → dist/ (ESM, node20 target, with #!/usr/bin/env node banner)
+npm run build      # tsup → dist/ (ESM, node20 target, JSX via tsconfig, #!/usr/bin/env node banner)
 npm run dev        # tsup --watch
 npm run start      # build then run dist/index.js
-npm run lint       # eslint src  (no .eslintrc — defaults only)
+npm run lint       # eslint src
 npm run typecheck  # tsc --noEmit
+npx tsx scripts/preview.tsx   # render the UX frames with sample data (no TTY/network) — use to iterate on the UI
 ```
 
-- **No test framework is configured.** Don't run `npm test`. To verify changes, run `npm run typecheck` and exercise the CLI manually with `npm run start` against a real provider CLI installed locally.
-- **No formatter is configured** (no prettier/biome). Match the surrounding style; don't introduce a formatter without asking.
-- Node `>=20.0.0` is required (engines pin).
+- **No test framework is configured.** Don't run `npm test`. To verify changes, run `npm run typecheck`, render `scripts/preview.tsx`, and exercise the CLI manually against a real Anthropic-compatible endpoint.
+- **No formatter is configured.** Match surrounding style; don't add a formatter without asking.
+- Node `>=20.0.0` required.
+
+## Endpoint profiles (auth)
+
+Secrets are **never persisted by us.** They come from one of two equally-ephemeral sources — process memory either way:
+
+1. **Environment** (preferred for repeat use):
+   ```bash
+   PAIR_PROFILE_<NAME>_BASE_URL   # Anthropic-compatible endpoint
+   PAIR_PROFILE_<NAME>_KEY        # API key / bearer token (required)
+   PAIR_PROFILE_<NAME>_MODEL      # default model id (optional)
+   ```
+   …plus the implicit official endpoint via the standard `ANTHROPIC_API_KEY` (+ optional `ANTHROPIC_BASE_URL`).
+2. **Interactively** at runtime: if no profiles are configured (or via "+ Add an endpoint…" in any role picker), the user types a base URL + key. `registerSessionProfile()` holds it in an in-memory `Map` for the session only — it is never written to disk. The profile name is auto-derived from the URL host (so `api.deepseek.com` → `deepseek`, which also makes it match curated model suggestions).
+
+A profile is "ready" only when its key is present, so the picker can only ever offer endpoints that can actually run. `loadProfiles()` merges env + session profiles (secrets stripped); `resolveProfile()` returns the secret (session store first, then env). At turn time `providers.ts` builds a per-call `env` overlay (`ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` + `ANTHROPIC_AUTH_TOKEN`); because the loop is strictly sequential, two roles on different endpoints never collide.
 
 ## Module layout (`src/`)
 
 Keep these boundaries — they're load-bearing:
 
-- `index.ts` — CLI entry, interactive setup, slash-command dispatch
-- `process.ts` — pair engine: spawns agent subprocesses, runs the turn loop
-- `prompt.ts` — interactive input (slash-command capture, selection UIs)
-- `providers.ts` — provider detection, CLI argv construction per provider
-- `state.ts` — `PairState` mutations only (no rendering, no I/O beyond `git status -s`)
-- `render.ts` / `ui.ts` — terminal rendering (chalk, log-update); no state mutation
-- `types.ts` — shared types and discriminated unions (`PairStatus`, `MessageType`, etc.)
+- `index.ts` — CLI entry; parses argv and renders the Ink `<App>` (also the `providers` subcommand + `--help`/`--version`)
+- `process.ts` — pair engine: `runTurn()` wraps one SDK `query()`; `runPairEngine()` runs the mentor→executor→mentor loop
+- `providers.ts` — env profile resolution (`loadProfiles`/`resolveProfile`/`profileEnv`) + model suggestions
+- `state.ts` — `PairState` mutations only (no rendering, no I/O beyond `git status`)
+- `types.ts` — shared types and unions (`Profile`, `AgentRuntime`, `ToolEvent`, `PairStatus`, …). No CLI `ProviderKind`.
+- `ui.ts` — theme tokens (colour hexes, icons, formatters). No rendering, no state.
+- `app.tsx` — Ink root: setup wizard (spec → per-role profile/model), session view, slash-command dispatch
+- `components.tsx` — presentational Ink components (Banner, StatusBar, AgentBar, MessageView, LiveTurn, ResultPanel, verdict chip)
+- `inputs.tsx` — interactive Ink inputs (`Select`, `SearchSelect`, `TextPrompt`, `SlashInput`) + fuzzy match
+- `useEngine.ts` — bridges the engine's imperative callbacks to React state (live streaming buffers, throttled)
 
-Don't mix concerns across these files (e.g., don't mutate state from `render.ts`, don't render from `state.ts`).
+Don't mix concerns: no state mutation in components, no rendering in `state.ts`, no React in `process.ts`/`providers.ts`/`state.ts`.
 
 ## TypeScript / module conventions
 
-- `"type": "module"` + `moduleResolution: "bundler"`. Relative imports must use `.js` extensions (e.g., `import { foo } from './state.js'`) even though sources are `.ts`.
-- `strict: true` is on. Type every function signature; prefer discriminated unions over `any`.
-- ESM only — no `require()`, no CommonJS-style exports.
+- `"type": "module"` + `moduleResolution: "bundler"`. Relative imports use `.js` extensions even from `.ts`/`.tsx` sources.
+- `strict: true`. Type every signature; prefer discriminated unions over `any`.
+- JSX: `react-jsx` (automatic runtime) via tsconfig; React 19 + Ink 7. In `.tsx`, import the `JSX` type explicitly (`import type { JSX } from 'react'`) — React 19 moved it off the global namespace.
+- ESM only — no `require()`/CommonJS.
 
 ## Pair-engine invariants
 
 Breaking any of these will silently corrupt the loop:
 
-- **Only the Mentor may emit `TASK_COMPLETE`**, and it must appear on its own line. The Executor's system prompt explicitly forbids this sentinel. If `TASK_COMPLETE` isn't emitted, the loop continues until `maxIterations` (default 20, see `index.ts`).
-- **Turn timeout is 10 minutes** (`TURN_TIMEOUT_MS` in `process.ts`). Long-running agent calls past this will reject the turn.
-- **Mentor reviews must include the structured JSON block** specified in the Mentor system prompt (`{"verdict":..., "risk":..., "nextStep":{...}}`). Don't strip or restructure that contract without updating the parser.
-- **Output parsing is intentionally permissive** — it harvests text from many JSON event keys (`text`, `content`, `message`, `delta`, `parts`, `output_text`, `response`, `output`) because each provider CLI streams differently. When adding a new provider, verify which keys it emits rather than assuming.
-- **Session continuity** uses each CLI's `--resume`/session-id mechanism (captured from stream output). Don't try to serialize agent state ourselves.
+- **Only the Mentor may emit `TASK_COMPLETE`**, on its own line. The Executor's system-prompt append forbids it. Without it the loop runs to `maxIterations` (default 20).
+- **Roles are asymmetric and enforced via the SDK.** Executor: `permissionMode: 'bypassPermissions'`, full tools. Mentor: read-only — `allowedTools: ['Read','Grep','Glob']` + everything else `disallowedTools`. The mentor inspects to verify but can never mutate. The Executor attaches its own build/test output as evidence because the mentor cannot run commands.
+- **Turn timeout is 10 minutes** (`TURN_TIMEOUT_MS`); on timeout the turn's `AbortController` aborts and the active `query` is interrupted.
+- **Mentor reviews must include the structured JSON block** (`{"verdict":…, "risk":…, "nextStep":{…}}`). `components.tsx` parses it into a verdict chip; don't change the contract without updating `parseVerdict`.
+- **Streaming**: `includePartialMessages: true` yields `stream_event` text deltas (live text) and `assistant` messages carry `tool_use` blocks (the tool timeline); the final `result` message carries the canonical output + `session_id` + usage. Read `result.result` — don't re-harvest text from intermediate events.
+- **Session continuity** is per-turn: each turn starts a fresh `query()` with `resume: <sessionId>` captured from the prior turn's `system/init` or `result` message.
 
-## Adding a provider
+## Adding an endpoint
 
-Edit `providers.ts`:
-1. Add an entry to `PROVIDERS` with `cli`, `aliases`, version-check args
-2. Implement argv construction in `buildCommand`
-3. Add models to `MODEL_CATALOGS`
-4. Add a default in `getDefaultModel`
-
-The provider is auto-detected at startup by running its `--version` (or equivalent) — only installed CLIs appear in selection.
+Nothing to edit — declare `PAIR_PROFILE_<NAME>_BASE_URL` + `_KEY` (+ optional `_MODEL`) in the environment and it appears in the picker. To add curated model suggestions for a brand, extend `SUGGESTIONS` in `providers.ts` (users can always type a custom model id).
 
 ## Git assumption
 
-`state.ts` runs `git status -s` via `execSync` to track modified files. The harness assumes the working directory is a git repo; there's no fallback path.
+`state.ts` runs `git` via `execSync` to track modified files. The harness assumes a git repo; there's no fallback path.
