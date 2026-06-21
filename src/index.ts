@@ -2,7 +2,8 @@ import { resolve } from 'node:path';
 import { createElement } from 'react';
 import { render } from 'ink';
 import { App } from './app.js';
-import { loadProfiles } from './providers.js';
+import { loadProfiles, isProfilePersisted } from './providers.js';
+import { configPath } from './config.js';
 
 const VERSION = '0.2.0';
 
@@ -19,11 +20,16 @@ Options:
   -h, --help      Show this help
   -v, --version   Show version
 
-Endpoints are declared in the environment (never persisted):
+Endpoints come from the environment (never persisted by us):
   PAIR_PROFILE_<NAME>_BASE_URL   Anthropic-compatible endpoint
   PAIR_PROFILE_<NAME>_KEY        API key / bearer token
   PAIR_PROFILE_<NAME>_MODEL      default model id (optional)
 …or the standard ANTHROPIC_API_KEY (+ optional ANTHROPIC_BASE_URL).
+
+You can also enter an endpoint interactively and choose to save it to
+  ${configPath()}  (chmod 600)
+Env vars take precedence over a saved profile of the same name. Manage saved
+credentials in-app with /config; env stays the way to skip the prompt entirely.
 
 Examples:
   pair-code . "Fix the login bug in auth.ts"
@@ -39,7 +45,8 @@ function printProfiles(): void {
   }
   console.log('Configured endpoint profiles:');
   for (const p of profiles) {
-    console.log(`  • ${p.label}  (${p.baseUrl || 'official anthropic api'})${p.defaultModel ? `  default: ${p.defaultModel}` : ''}`);
+    const saved = isProfilePersisted(p.name) ? '  [saved]' : '';
+    console.log(`  • ${p.label}  (${p.baseUrl || 'official anthropic api'})${p.defaultModel ? `  default: ${p.defaultModel}` : ''}${saved}`);
   }
 }
 

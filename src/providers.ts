@@ -1,16 +1,21 @@
 import type { Profile, ResolvedProfile } from './types.js';
+import { readConfig, writeConfig } from './config.js';
 
 /**
- * Profiles are declared in the environment — we never persist a key to disk.
- * Two shapes are recognised:
+ * Profiles come from three sources, in precedence order:
  *
- *   PAIR_PROFILE_<NAME>_BASE_URL   Anthropic-compatible endpoint (required for named profiles)
- *   PAIR_PROFILE_<NAME>_KEY        API key / bearer token            (required)
- *   PAIR_PROFILE_<NAME>_MODEL      default model id                  (optional)
+ *   1. Environment (never persisted by us):
+ *        PAIR_PROFILE_<NAME>_BASE_URL   Anthropic-compatible endpoint
+ *        PAIR_PROFILE_<NAME>_KEY        API key / bearer token            (required)
+ *        PAIR_PROFILE_<NAME>_MODEL      default model id                  (optional)
+ *      …plus the implicit official endpoint via the standard ANTHROPIC_API_KEY
+ *      (+ optional ANTHROPIC_BASE_URL).
+ *   2. Session profiles entered interactively — in-memory for the session only.
+ *   3. Saved profiles the user opted to "remember" — persisted to the on-disk
+ *      config (see config.ts). This is the only place a key touches disk.
  *
- * plus the implicit official endpoint via the standard ANTHROPIC_API_KEY
- * (+ optional ANTHROPIC_BASE_URL). A profile is "ready" only when its key is
- * present, so the picker can only ever offer endpoints that can actually run.
+ * A profile is "ready" only when its key is present, so the picker can only ever
+ * offer endpoints that can actually run.
  */
 
 const PROFILE_PREFIX = 'PAIR_PROFILE_';
@@ -38,6 +43,44 @@ export function registerSessionProfile(input: { baseUrl: string; apiKey: string;
   };
   sessionProfiles.set(name, resolved);
   return resolved;
+}
+
+/**
+ * Save an endpoint to the on-disk config so it survives across sessions. Re-entry
+ * of the same derived name overwrites in place (handy for rotating a key); a
+ * clash with an env/session name is suffixed so it never shadows those.
+ */
+export function persistProfile(input: { baseUrl: string; apiKey: string; name?: string; defaultModel?: string }): ResolvedProfile {
+  const baseUrl = input.baseUrl.trim();
+  const base = input.name ?? deriveName(baseUrl);
+  const cfg = readConfig();
+  const name = cfg.profiles[base] ? base : uniqueName(base);
+  cfg.profiles[name] = { baseUrl, apiKey: input.apiKey, defaultModel: input.defaultModel };
+  writeConfig(cfg);
+  return { name, label: humanizeProfileName(name), baseUrl, defaultModel: input.defaultModel, apiKey: input.apiKey };
+}
+
+/** Add an interactively-entered endpoint, persisting it only if the user opts in. */
+export function addEndpoint(input: { baseUrl: string; apiKey: string; remember: boolean; name?: string; defaultModel?: string }): ResolvedProfile {
+  return input.remember ? persistProfile(input) : registerSessionProfile(input);
+}
+
+/** Saved (persisted) profiles only, secrets stripped — for the /config manager. */
+export function persistedProfiles(): Profile[] {
+  return loadPersistedProfiles();
+}
+
+export function isProfilePersisted(name: string): boolean {
+  return name in readConfig().profiles;
+}
+
+/** Delete a saved profile from disk. Returns false if it wasn't saved. */
+export function forgetProfile(name: string): boolean {
+  const cfg = readConfig();
+  if (!(name in cfg.profiles)) return false;
+  delete cfg.profiles[name];
+  writeConfig(cfg);
+  return true;
 }
 
 function deriveName(baseUrl: string): string {
@@ -98,8 +141,23 @@ export function loadProfiles(): Profile[] {
     }
   }
 
+  // Saved profiles from the on-disk config (secrets stripped from the listing).
+  for (const sp of loadPersistedProfiles()) {
+    if (!profiles.some(p => p.name === sp.name)) profiles.push(sp);
+  }
+
   profiles.sort((a, b) => a.label.localeCompare(b.label));
   return profiles;
+}
+
+/** Saved profiles from the on-disk config, secrets stripped. */
+function loadPersistedProfiles(): Profile[] {
+  return Object.entries(readConfig().profiles).map(([name, p]) => ({
+    name,
+    label: humanizeProfileName(name),
+    baseUrl: p.baseUrl,
+    defaultModel: p.defaultModel,
+  }));
 }
 
 /** Resolve a profile *with* its secret, for use at turn time. */
@@ -108,11 +166,17 @@ export function resolveProfile(name: string): ResolvedProfile | undefined {
   if (session) return session;
   const base = loadProfiles().find(p => p.name === name);
   if (!base) return undefined;
-  const apiKey = name === 'anthropic'
+
+  // Environment takes precedence over a saved key with the same name.
+  const envKey = name === 'anthropic'
     ? envValue('ANTHROPIC_API_KEY')
     : envValue(`${PROFILE_PREFIX}${name.toUpperCase()}_KEY`);
-  if (!apiKey) return undefined;
-  return { ...base, apiKey };
+  if (envKey) return { ...base, apiKey: envKey };
+
+  const stored = readConfig().profiles[name];
+  if (stored?.apiKey) return { ...base, apiKey: stored.apiKey };
+
+  return undefined;
 }
 
 /**

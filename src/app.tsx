@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, type ReactNode, type JSX } from 'react';
 import { execSync } from 'node:child_process';
 import { Box, Text, Static, useApp, useInput, useStdout } from 'ink';
 import type { PairState, Message, Profile } from './types.js';
-import { loadProfiles, suggestModels, profileLabel, registerSessionProfile } from './providers.js';
+import { loadProfiles, suggestModels, profileLabel, addEndpoint, forgetProfile, persistedProfiles } from './providers.js';
+import { configPath } from './config.js';
 import { createPairState, addMessage } from './state.js';
 import { useEngine } from './useEngine.js';
 import { Select, SearchSelect, TextPrompt, SlashInput, type SlashCommand, type SearchItem } from './inputs.js';
@@ -12,6 +13,7 @@ import { colors, icons, truncate } from './ui.js';
 const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'task', description: 'Start a new task with the current agents' },
   { name: 'resume', description: 'Continue a paused session' },
+  { name: 'config', description: 'Configure endpoints, models & saved credentials' },
   { name: 'mentor', description: 'Re-select mentor profile & model' },
   { name: 'runner', description: 'Re-select executor profile & model' },
   { name: 'model', description: 'Show current model configuration' },
@@ -31,10 +33,11 @@ const ADD_ENDPOINT = '__add_endpoint__';
 // ── Endpoint entry (base URL + key, held in memory only) ─────────────────
 
 function EndpointForm(props: {
-  onDone: (input: { baseUrl: string; apiKey: string }) => void;
+  onDone: (input: { baseUrl: string; apiKey: string; remember: boolean }) => void;
   onCancel?: () => void;
 }): JSX.Element {
   const [baseUrl, setBaseUrl] = useState<string | null>(null);
+  const [apiKey, setApiKey] = useState<string | null>(null);
 
   if (baseUrl === null) {
     return (
@@ -46,15 +49,32 @@ function EndpointForm(props: {
       />
     );
   }
+  if (apiKey === null) {
+    return (
+      <Box flexDirection="column">
+        <Text dimColor>  {icons.check} {baseUrl}</Text>
+        <TextPrompt
+          message="API key"
+          placeholder="your endpoint API key / bearer token"
+          mask
+          onSubmit={(v) => setApiKey(v)}
+          onCancel={() => setBaseUrl(null)}
+        />
+      </Box>
+    );
+  }
   return (
     <Box flexDirection="column">
       <Text dimColor>  {icons.check} {baseUrl}</Text>
-      <TextPrompt
-        message="API key"
-        placeholder="kept in memory, never written to disk"
-        mask
-        onSubmit={(apiKey) => props.onDone({ baseUrl, apiKey })}
-        onCancel={() => setBaseUrl(null)}
+      <Text dimColor>  {icons.check} key {'•'.repeat(8)}</Text>
+      <Select
+        message="Remember these credentials on this machine?"
+        items={[
+          { label: 'Yes — save them for next time', value: 'yes', hint: `${configPath()} · chmod 600` },
+          { label: 'No — this session only', value: 'no', hint: 'kept in memory, forgotten on exit' },
+        ]}
+        onSubmit={(v) => props.onDone({ baseUrl, apiKey, remember: v === 'yes' })}
+        onCancel={() => setApiKey(null)}
       />
     </Box>
   );
@@ -80,7 +100,7 @@ function RolePicker(props: {
         <Text dimColor>  Add an Anthropic-compatible endpoint (this session only)</Text>
         <EndpointForm
           onCancel={() => setAdding(false)}
-          onDone={({ baseUrl, apiKey }) => { const r = registerSessionProfile({ baseUrl, apiKey }); setAdding(false); setChosen(r); }}
+          onDone={({ baseUrl, apiKey, remember }) => { const r = addEndpoint({ baseUrl, apiKey, remember }); setAdding(false); setChosen(r); }}
         />
       </Box>
     );
@@ -207,6 +227,85 @@ function SetupWizard(props: {
   );
 }
 
+// ── /config overlays ─────────────────────────────────────────────────────
+
+/** Top-level /config menu: route to a role picker or the saved-creds manager. */
+function ConfigMenu(props: {
+  state: PairState;
+  onPick: (overlay: 'mentor' | 'runner' | 'creds') => void;
+  onClose: () => void;
+}): JSX.Element {
+  const savedCount = persistedProfiles().length;
+  return (
+    <Box flexDirection="column" marginY={1}>
+      <Select
+        message="Configure"
+        items={[
+          { label: 'Mentor endpoint & model', value: 'mentor', hint: `${profileLabel(props.state.mentor.profileName)} / ${props.state.mentor.model}` },
+          { label: 'Executor endpoint & model', value: 'runner', hint: `${profileLabel(props.state.executor.profileName)} / ${props.state.executor.model}` },
+          { label: 'Manage saved credentials', value: 'creds', hint: savedCount ? `${savedCount} saved` : 'none saved' },
+          { label: 'Close', value: 'close' },
+        ]}
+        onSubmit={(v) => (v === 'close' ? props.onClose() : props.onPick(v as 'mentor' | 'runner' | 'creds'))}
+        onCancel={props.onClose}
+      />
+    </Box>
+  );
+}
+
+/** List saved endpoints and let the user delete one (the key) from disk. */
+function CredsManager(props: { onBack: () => void; onNotice: (n: ReactNode) => void }): JSX.Element {
+  const [tick, setTick] = useState(0);
+  const [pending, setPending] = useState<string | null>(null);
+  const saved = persistedProfiles(); // re-read on each render; `tick` forces it after a delete
+
+  if (saved.length === 0) {
+    return (
+      <Box flexDirection="column" marginY={1}>
+        <Text dimColor>  Nothing saved yet. Add an endpoint and choose “Yes — save them” to remember it here.</Text>
+        <Box marginTop={1}>
+          <Select message="Saved credentials" items={[{ label: 'Back', value: 'back' }]} onSubmit={props.onBack} onCancel={props.onBack} />
+        </Box>
+      </Box>
+    );
+  }
+
+  if (pending) {
+    const label = profileLabel(pending);
+    return (
+      <Box flexDirection="column" marginY={1}>
+        <Select
+          message={`Remove saved credentials for ${label}?`}
+          items={[
+            { label: 'No, keep it', value: 'no' },
+            { label: 'Yes, delete the key from disk', value: 'yes' },
+          ]}
+          onSubmit={(v) => {
+            if (v === 'yes') { forgetProfile(pending); props.onNotice(<Text dimColor>{icons.check} removed saved credentials for {label}</Text>); }
+            setPending(null);
+            setTick(t => t + 1);
+          }}
+          onCancel={() => setPending(null)}
+        />
+      </Box>
+    );
+  }
+
+  return (
+    <Box flexDirection="column" marginY={1} key={tick}>
+      <Select
+        message="Manage saved credentials"
+        items={[
+          ...saved.map(p => ({ label: p.label, value: p.name, hint: p.baseUrl || 'official api' })),
+          { label: 'Back', value: '__back__' },
+        ]}
+        onSubmit={(v) => (v === '__back__' ? props.onBack() : setPending(v))}
+        onCancel={props.onBack}
+      />
+    </Box>
+  );
+}
+
 // ── Session ──────────────────────────────────────────────────────────────
 
 function freshTask(prev: PairState, spec: string): PairState {
@@ -230,7 +329,7 @@ function Session(props: { initialState: PairState }): JSX.Element {
   // "+ Add endpoint") appear immediately; loadProfiles() is a cheap env scan.
   const profiles = loadProfiles();
 
-  const [overlay, setOverlay] = useState<null | 'mentor' | 'runner'>(null);
+  const [overlay, setOverlay] = useState<null | 'mentor' | 'runner' | 'config' | 'creds'>(null);
   const [notice, setNotice] = useState<ReactNode | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [transcript, setTranscript] = useState<Message[]>([]);
@@ -271,6 +370,7 @@ function Session(props: { initialState: PairState }): JSX.Element {
     const arg = rest.join(' ').trim();
     switch (cmd) {
       case 'quit': case 'exit': exit(); break;
+      case 'config': setOverlay('config'); break;
       case 'mentor': setOverlay('mentor'); break;
       case 'runner': setOverlay('runner'); break;
       case 'task': if (arg) void runReplace(freshTask(state, arg)); else setNotice(<Text dimColor>Usage: /task &lt;spec&gt;</Text>); break;
@@ -300,8 +400,17 @@ function Session(props: { initialState: PairState }): JSX.Element {
     }
   };
 
-  if (overlay) {
+  if (overlay === 'config') {
+    return <ConfigMenu state={state} onPick={(o) => setOverlay(o)} onClose={() => setOverlay(null)} />;
+  }
+
+  if (overlay === 'creds') {
+    return <CredsManager onBack={() => setOverlay('config')} onNotice={setNotice} />;
+  }
+
+  if (overlay === 'mentor' || overlay === 'runner') {
     const role = overlay === 'mentor' ? 'mentor' : 'executor';
+    const overlayName = overlay;
     return (
       <Box flexDirection="column" marginY={1}>
         <RolePicker
@@ -314,7 +423,7 @@ function Session(props: { initialState: PairState }): JSX.Element {
             const next = { ...state, [role]: { ...state[role], profileName: pick.profileName, baseUrl: pick.baseUrl, model: pick.model, sessionId: undefined } };
             engine.setState(next as PairState);
             setOverlay(null);
-            setNotice(<Text color={role === 'mentor' ? colors.mentor : colors.executor}>{icons.check} {overlay} → {profileLabel(pick.profileName)} / {pick.model}</Text>);
+            setNotice(<Text color={role === 'mentor' ? colors.mentor : colors.executor}>{icons.check} {overlayName} → {profileLabel(pick.profileName)} / {pick.model}</Text>);
           }}
         />
       </Box>
@@ -377,10 +486,10 @@ export function App(props: { directory: string; initialSpec: string }): JSX.Elem
         <Box flexDirection="column" marginBottom={1}>
           <Text><Text color={colors.accent}>{icons.sparkle} Let's connect an endpoint to get started.</Text></Text>
           <Text dimColor>  Any Anthropic-compatible endpoint works — GLM, DeepSeek, Kimi, Qwen, a gateway, or the official API.</Text>
-          <Text dimColor>  Nothing is written to disk; the key stays in memory for this session.</Text>
+          <Text dimColor>  You choose whether to save it on this machine or keep it only for this session.</Text>
           <Text dimColor>  Tip: export PAIR_PROFILE_&lt;NAME&gt;_BASE_URL + _KEY to skip this next time.</Text>
         </Box>
-        <EndpointForm onDone={({ baseUrl, apiKey }) => { registerSessionProfile({ baseUrl, apiKey }); setProfiles(loadProfiles()); }} />
+        <EndpointForm onDone={({ baseUrl, apiKey, remember }) => { addEndpoint({ baseUrl, apiKey, remember }); setProfiles(loadProfiles()); }} />
       </Box>
     );
   }

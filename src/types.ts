@@ -5,10 +5,11 @@ export type PairStatus = 'idle' | 'mentoring' | 'executing' | 'reviewing' | 'pau
 export type ActivityPhase = 'idle' | 'thinking' | 'using_tools' | 'responding' | 'waiting' | 'error' | 'stalled';
 
 /**
- * An Anthropic-compatible endpoint declared in the environment. A profile is
- * the unit a role binds to: it carries the base URL + API key, never persisted
- * by us — the key is resolved from `env` on demand. `name === 'anthropic'` with
- * an empty `baseUrl` means the official Anthropic API.
+ * An Anthropic-compatible endpoint a role binds to. It carries the base URL +
+ * API key; the key is resolved on demand from one of three sources — env, the
+ * in-memory session store, or the opt-in saved config (see config.ts) — so a
+ * key only ever reaches disk when the user explicitly chose to remember it.
+ * `name === 'anthropic'` with an empty `baseUrl` means the official Anthropic API.
  */
 export interface Profile {
   /** Stable identifier, e.g. "glm", "deepseek", "anthropic". */

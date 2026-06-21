@@ -25,7 +25,7 @@ npx tsx scripts/preview.tsx   # render the UX frames with sample data (no TTY/ne
 
 ## Endpoint profiles (auth)
 
-Secrets are **never persisted by us.** They come from one of two equally-ephemeral sources — process memory either way:
+Secrets come from one of three sources. The first two are equally ephemeral (process memory); the third persists **only with explicit opt-in**:
 
 1. **Environment** (preferred for repeat use):
    ```bash
@@ -34,9 +34,10 @@ Secrets are **never persisted by us.** They come from one of two equally-ephemer
    PAIR_PROFILE_<NAME>_MODEL      # default model id (optional)
    ```
    …plus the implicit official endpoint via the standard `ANTHROPIC_API_KEY` (+ optional `ANTHROPIC_BASE_URL`).
-2. **Interactively** at runtime: if no profiles are configured (or via "+ Add an endpoint…" in any role picker), the user types a base URL + key. `registerSessionProfile()` holds it in an in-memory `Map` for the session only — it is never written to disk. The profile name is auto-derived from the URL host (so `api.deepseek.com` → `deepseek`, which also makes it match curated model suggestions).
+2. **Interactively, session-only**: if no profiles are configured (or via "+ Add an endpoint…" in any role picker), the user types a base URL + key, then chooses **"No — this session only"**. `registerSessionProfile()` holds it in an in-memory `Map` for the session — never written to disk. The profile name is auto-derived from the URL host (so `api.deepseek.com` → `deepseek`, which also makes it match curated model suggestions).
+3. **Interactively, saved** (opt-in): same flow, but the user chooses **"Yes — save them"**. `persistProfile()` writes the endpoint + model + key to `config.json` under the user's config dir (`$XDG_CONFIG_HOME/pair-code` or `~/.config/pair-code`), with the file at `0600` inside a `0700` dir — the only place a key touches disk. `/config → Manage saved credentials` deletes them. Re-saving the same endpoint overwrites in place (key rotation).
 
-A profile is "ready" only when its key is present, so the picker can only ever offer endpoints that can actually run. `loadProfiles()` merges env + session profiles (secrets stripped); `resolveProfile()` returns the secret (session store first, then env). At turn time `providers.ts` builds a per-call `env` overlay (`ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` + `ANTHROPIC_AUTH_TOKEN`); because the loop is strictly sequential, two roles on different endpoints never collide.
+A profile is "ready" only when its key is present, so the picker can only ever offer endpoints that can actually run. `loadProfiles()` merges env + session + saved profiles (secrets stripped); `resolveProfile()` returns the secret (session store → env → saved config, so an env key always shadows a saved one of the same name). At turn time `providers.ts` builds a per-call `env` overlay (`ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` + `ANTHROPIC_AUTH_TOKEN`); because the loop is strictly sequential, two roles on different endpoints never collide.
 
 ## Module layout (`src/`)
 
@@ -44,7 +45,8 @@ Keep these boundaries — they're load-bearing:
 
 - `index.ts` — CLI entry; parses argv and renders the Ink `<App>` (also the `providers` subcommand + `--help`/`--version`)
 - `process.ts` — pair engine: `runTurn()` wraps one SDK `query()`; `runPairEngine()` runs the mentor→executor→mentor loop
-- `providers.ts` — env profile resolution (`loadProfiles`/`resolveProfile`/`profileEnv`) + model suggestions
+- `providers.ts` — profile resolution across env + session + saved (`loadProfiles`/`resolveProfile`/`profileEnv`/`addEndpoint`/`persistProfile`/`forgetProfile`) + model suggestions
+- `config.ts` — the on-disk config: `readConfig`/`writeConfig`/`configPath` (atomic write, `0600`). Pure I/O — no profile/merge logic (that's `providers.ts`), no React
 - `state.ts` — `PairState` mutations only (no rendering, no I/O beyond `git status`)
 - `types.ts` — shared types and unions (`Profile`, `AgentRuntime`, `ToolEvent`, `PairStatus`, …). No CLI `ProviderKind`.
 - `ui.ts` — theme tokens (colour hexes, icons, formatters). No rendering, no state.
@@ -53,7 +55,7 @@ Keep these boundaries — they're load-bearing:
 - `inputs.tsx` — interactive Ink inputs (`Select`, `SearchSelect`, `TextPrompt`, `SlashInput`) + fuzzy match
 - `useEngine.ts` — bridges the engine's imperative callbacks to React state (live streaming buffers, throttled)
 
-Don't mix concerns: no state mutation in components, no rendering in `state.ts`, no React in `process.ts`/`providers.ts`/`state.ts`.
+Don't mix concerns: no state mutation in components, no rendering in `state.ts`, no React in `process.ts`/`providers.ts`/`state.ts`/`config.ts`.
 
 ## TypeScript / module conventions
 
@@ -75,7 +77,7 @@ Breaking any of these will silently corrupt the loop:
 
 ## Adding an endpoint
 
-Nothing to edit — declare `PAIR_PROFILE_<NAME>_BASE_URL` + `_KEY` (+ optional `_MODEL`) in the environment and it appears in the picker. To add curated model suggestions for a brand, extend `SUGGESTIONS` in `providers.ts` (users can always type a custom model id).
+Nothing to edit — declare `PAIR_PROFILE_<NAME>_BASE_URL` + `_KEY` (+ optional `_MODEL`) in the environment and it appears in the picker. Or add one at runtime via "+ Add an endpoint…" / `/config` and optionally save it to disk. To add curated model suggestions for a brand, extend `SUGGESTIONS` in `providers.ts` (users can always type a custom model id).
 
 ## Git assumption
 
