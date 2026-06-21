@@ -48,6 +48,10 @@ export const icons = {
   pencil: isUnicode ? '✎' : '~',
   search: isUnicode ? '◎' : 'o',
   gear: isUnicode ? '⚙' : '#',
+  infinity: isUnicode ? '∞' : 'inf',
+  arrowDown: isUnicode ? '↓' : 'v',
+  corner: isUnicode ? '╰' : '\\',
+  caret: isUnicode ? '▌' : '|',
 } as const;
 
 export const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -68,6 +72,15 @@ export function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
+}
+
+/**
+ * Render the iteration counter. An unlimited run (maxIterations === Infinity,
+ * the default) has no meaningful denominator, so we show the count against the
+ * infinity glyph — `3/∞` — rather than `3/Infinity`.
+ */
+export function formatIterations(iteration: number, max: number): string {
+  return Number.isFinite(max) ? `${iteration}/${max}` : `${iteration}/${icons.infinity}`;
 }
 
 export function truncate(str: string, maxLen: number): string {

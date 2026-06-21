@@ -1,7 +1,7 @@
 import { query, type Query, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { PairState, AgentRuntime, ToolEvent, TokenUsage, ActivityPhase } from './types.js';
 import { resolveProfile, profileEnv } from './providers.js';
-import { addMessage, hasFinishSignal, setPairStatus, updateActivity, getConversationHistory, getGitChanges, prepareRun, getTaskSpec } from './state.js';
+import { addMessage, hasFinishSignal, setPairStatus, updateActivity, getConversationHistory, getGitChanges, prepareRun, getTaskSpec, initializeGreetingState, addGreetingMessage, isGreetingComplete } from './state.js';
 
 const TURN_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes per turn
 const EMPTY_OUTPUT = '(No textual output produced)';
@@ -198,6 +198,28 @@ const HANDOFF_PROMPTS = {
     `## Task\n${spec}\n\n## Conversation History\n${history}\n\n## Executor's Latest Work (with its own verification evidence)\n${executorResult}\n\nReview the work read-only. Use Read/Grep/Glob to independently confirm the changes and the evidence — do not trust the self-report blindly. Check completeness, correctness, and quality.\n\nIf it fully satisfies the task, respond with TASK_COMPLETE on its own line. Otherwise explain precisely what must be fixed and hand back.\n\nAlways include a structured review:\n\`\`\`json\n{"verdict":"pass|fail","risk":"low|medium|high","confidence":0.0-1.0,"issues":[],"evidence":[],"reasoning":"...","summary":"...","nextStep":{"action":"continue|finish","instructions":[]}}\n\`\`\``,
 };
 
+// ── Greeting smoke-test prompts ─────────────────────────────────────────
+// A lightweight 3-turn script that exercises the pair loop (streaming, profile
+// resolution, per-role tool asymmetry, session continuity, timeout) without a
+// coding task. The mentor owns the finishing TASK_COMPLETE, preserving the
+// invariant in CLAUDE.md; the executor is reminded of the prohibition on its
+// turn (EXECUTOR_APPEND already forbids it).
+const GREETING_PROMPTS = {
+  mentorHello: () =>
+    `This is a greeting smoke-test of the pair loop — there is no coding task. ` +
+    `Briefly say hello to the executor and ask it to confirm it is ready (one or two sentences). ` +
+    `Do NOT plan, review, or write code. Do NOT emit TASK_COMPLETE.`,
+
+  executorHello: (mentorHello: string) =>
+    `## Mentor's greeting\n${mentorHello}\n\nThis is a greeting smoke-test — no coding task. ` +
+    `Briefly say hello back and confirm you are ready (one or two sentences). Do NOT write code. ` +
+    `Do NOT emit TASK_COMPLETE — only the mentor can finish.`,
+
+  mentorFinish: (executorHello: string) =>
+    `## Executor's greeting\n${executorHello}\n\nThe greeting exchange is complete. ` +
+    `Acknowledge in one sentence, then end the session by emitting TASK_COMPLETE on its own line.`,
+};
+
 // ── Engine loop ─────────────────────────────────────────────────────────
 
 export interface EngineCallbacks {
@@ -290,7 +312,9 @@ export async function runPairEngine(
       const changes = await getGitChanges(state.directory);
       if (changes.length > 0) { state = { ...state, modifiedFiles: changes }; update(state); }
 
-      if (state.iteration >= state.maxIterations) {
+      // Only fires when a finite cap was set explicitly; the default is
+      // Infinity (unlimited), so the loop runs until the mentor finishes.
+      if (Number.isFinite(state.maxIterations) && state.iteration >= state.maxIterations) {
         state = setPairStatus(state, 'paused', `Max iterations reached (${state.maxIterations})`);
         update(state);
         break;
@@ -324,6 +348,117 @@ export async function runPairEngine(
         state = addMessage(state, { from: 'mentor', to: 'executor', type: 'handoff', content: 'Passing back to executor with feedback' });
         update(state);
       }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (shouldStop()) {
+      state = setPairStatus(state, 'paused', 'Stopped by user during turn');
+    } else {
+      onError(msg);
+      state = setPairStatus(state, 'error', msg);
+    }
+    update(state);
+  }
+
+  return state;
+}
+
+// ── Greeting smoke-test loop ─────────────────────────────────────────────
+//
+// Unlike the open-ended task loop (which must NOT auto-finish — it waits for
+// the mentor's TASK_COMPLETE up to maxIterations), the greeting session owns
+// its own termination: once the mentor's ack turn runs and the exchange is
+// complete, it finishes unconditionally so it can never hang.
+//
+// Round flow (matches GreetingState.maxRounds = 2):
+//   1. mentor  — greet the executor            → greeting round 1
+//   2. executor — greet back, confirm ready     → greeting round 2 (complete)
+//   3. mentor  — ack, then emit TASK_COMPLETE   → status 'finished'
+export async function runGreetingSession(
+  initialState: PairState,
+  callbacks: EngineCallbacks,
+): Promise<PairState> {
+  let state = initialState;
+  const { onStateUpdate, onLog, onActivity, onTextDelta, onToolStart, onToolEnd, onMessage, onError, shouldStop } = callbacks;
+
+  const update = (s: PairState) => { state = s; onStateUpdate(s); };
+
+  const turnCallbacks = (role: 'mentor' | 'executor'): TurnCallbacks => ({
+    onTextDelta: (t) => onTextDelta(role, t),
+    onToolStart: (ev) => onToolStart(role, ev),
+    onToolEnd: (id, status) => onToolEnd(role, id, status),
+    onSessionId: (id) => {
+      state = role === 'mentor'
+        ? { ...state, mentor: { ...state.mentor, sessionId: id } }
+        : { ...state, executor: { ...state.executor, sessionId: id } };
+    },
+    onActivity: (phase, label) => { state = updateActivity(state, role, phase, label); onActivity(role, phase, label); update(state); },
+    onLog: (line) => onLog(role, line),
+  });
+
+  const checkStop = (): boolean => {
+    if (shouldStop()) {
+      killActiveTurn();
+      state = setPairStatus(state, 'paused', 'Stopped by user');
+      update(state);
+      return true;
+    }
+    return false;
+  };
+
+  if (!state.greetingState) state = { ...state, greetingState: initializeGreetingState() };
+
+  try {
+    // Turn 1 — mentor greets.
+    state = { ...prepareRun(state, 'mentor'), status: 'greeting' };
+    update(state);
+    if (checkStop()) return state;
+
+    onLog('mentor', 'Saying hello…');
+    const mentorHello = await runTurn(state.directory, 'mentor', state.mentor, GREETING_PROMPTS.mentorHello(), turnCallbacks('mentor'));
+    if (mentorHello.sessionId) state = { ...state, mentor: { ...state.mentor, sessionId: mentorHello.sessionId, tokenUsage: mentorHello.tokenUsage } };
+    state = addGreetingMessage(state, 'mentor', mentorHello.output);
+    state = addMessage(state, { from: 'mentor', to: 'executor', type: 'greeting', content: mentorHello.output });
+    state = updateActivity(state, 'mentor', 'idle', 'Greeting sent');
+    update(state);
+    onMessage(state);
+
+    if (checkStop()) return state;
+
+    // Turn 2 — executor greets back.
+    state = { ...prepareRun(state, 'executor'), status: 'greeting' };
+    update(state);
+    if (checkStop()) return state;
+
+    onLog('executor', 'Greeting back…');
+    const executorHello = await runTurn(state.directory, 'executor', state.executor, GREETING_PROMPTS.executorHello(mentorHello.output), turnCallbacks('executor'));
+    if (executorHello.sessionId) state = { ...state, executor: { ...state.executor, sessionId: executorHello.sessionId, tokenUsage: executorHello.tokenUsage } };
+    state = addGreetingMessage(state, 'executor', executorHello.output);
+    state = addMessage(state, { from: 'executor', to: 'mentor', type: 'greeting', content: executorHello.output });
+    state = updateActivity(state, 'executor', 'idle', 'Ready');
+    update(state);
+    onMessage(state);
+
+    if (checkStop()) return state;
+
+    // Turn 3 — mentor acknowledges and finishes (owns TASK_COMPLETE).
+    state = { ...prepareRun(state, 'mentor'), status: 'greeting' };
+    update(state);
+    if (checkStop()) return state;
+
+    onLog('mentor', 'Acknowledging…');
+    const mentorAck = await runTurn(state.directory, 'mentor', state.mentor, GREETING_PROMPTS.mentorFinish(executorHello.output), turnCallbacks('mentor'));
+    if (mentorAck.sessionId) state = { ...state, mentor: { ...state.mentor, sessionId: mentorAck.sessionId, tokenUsage: mentorAck.tokenUsage } };
+    state = addMessage(state, { from: 'mentor', to: 'executor', type: 'greeting', content: mentorAck.output });
+    state = updateActivity(state, 'mentor', 'idle', 'Acknowledged');
+    update(state);
+    onMessage(state);
+
+    // The greeting session finishes on its own terms — finish whether or not the
+    // model emitted the token, so it can never hang to maxIterations.
+    if (hasFinishSignal(mentorAck.output) || isGreetingComplete(state)) {
+      state = setPairStatus(state, 'finished', 'Greeting complete');
+      update(state);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

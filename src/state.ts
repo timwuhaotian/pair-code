@@ -29,7 +29,9 @@ export function createPairState(input: CreatePairInput): PairState {
     directory: input.directory,
     status: 'idle',
     iteration: 0,
-    maxIterations: input.maxIterations ?? 20,
+    // Unlimited by default — the loop runs until the mentor emits TASK_COMPLETE
+    // or the user stops it (Esc). A finite cap can still be passed explicitly.
+    maxIterations: input.maxIterations ?? Infinity,
     turn: 'mentor',
     mentor: {
       profileName: input.mentor.profileName,
@@ -60,7 +62,7 @@ export function addMessage(state: PairState, msg: Omit<Message, 'id' | 'timestam
   };
 
   const messages = [...state.messages];
-  if (msg.type === 'plan' || msg.type === 'result' || msg.type === 'acceptance' || msg.type === 'handoff' || msg.type === 'feedback') {
+  if (msg.type === 'plan' || msg.type === 'result' || msg.type === 'acceptance' || msg.type === 'handoff' || msg.type === 'feedback' || msg.type === 'greeting') {
     messages.push(message);
   }
 

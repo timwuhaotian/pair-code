@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { JSX } from 'react';
 import { Box, Text } from 'ink';
 import type { PairState, Message, ToolEvent, AgentRuntime, ActivityPhase } from './types.js';
-import { colors, icons, heroGradient, rgbHex, spinnerFrames, formatDuration, formatTokens, truncate } from './ui.js';
+import { colors, icons, heroGradient, rgbHex, spinnerFrames, formatDuration, formatIterations, formatTokens, truncate } from './ui.js';
 
 // ── Spinner ─────────────────────────────────────────────────────────────
 
@@ -13,6 +13,23 @@ export function Spinner({ color }: { color?: string }): JSX.Element {
     return () => clearInterval(t);
   }, []);
   return <Text color={color ?? colors.accent}>{spinnerFrames[frame]}</Text>;
+}
+
+/**
+ * Milliseconds elapsed since the timer was (re)started. Resets whenever
+ * `resetKey` changes — the live turn keys it on the active role, so the clock
+ * measures the current turn rather than the whole session.
+ */
+function useElapsed(resetKey: string): number {
+  const [ms, setMs] = useState(0);
+  const startRef = useRef(Date.now());
+  useEffect(() => {
+    startRef.current = Date.now();
+    setMs(0);
+    const t = setInterval(() => setMs(Date.now() - startRef.current), 500);
+    return () => clearInterval(t);
+  }, [resetKey]);
+  return ms;
 }
 
 // ── Banner ──────────────────────────────────────────────────────────────
@@ -62,6 +79,7 @@ export function Banner(): JSX.Element {
 const STATUS_COLOR: Record<string, string> = {
   finished: colors.success, error: colors.error, paused: colors.warn,
   mentoring: colors.mentor, executing: colors.executor, reviewing: colors.info,
+  greeting: colors.accent,
 };
 
 function statusGlyph(status: string): string {
@@ -79,7 +97,7 @@ export function StatusBar({ state, elapsedMs }: { state: PairState; elapsedMs: n
       <Text>
         <Text color={color}>{statusGlyph(state.status)} </Text>
         <Text color={color} bold>{state.status.replace(/_/g, ' ').toUpperCase()}</Text>
-        <Text dimColor>  iter {state.iteration}/{state.maxIterations}  {formatDuration(elapsedMs)}</Text>
+        <Text dimColor>  iter {formatIterations(state.iteration, state.maxIterations)}  {formatDuration(elapsedMs)}</Text>
         {tok > 0 ? <Text dimColor>  {formatTokens(tok)} tok</Text> : null}
       </Text>
       <Text>
@@ -133,13 +151,15 @@ const TOOL_VERB: Record<string, string> = {
 
 export function ToolLine({ ev }: { ev: ToolEvent }): JSX.Element {
   const verb = TOOL_VERB[ev.name] ?? ev.name;
-  const glyph = ev.status === 'running' ? icons.chevron : ev.status === 'error' ? icons.cross : icons.check;
+  const running = ev.status === 'running';
   const color = ev.status === 'error' ? colors.error : ev.status === 'done' ? colors.success : colors.warn;
   return (
     <Text>
-      <Text color={color}>{glyph} </Text>
-      <Text dimColor>{verb}</Text>
-      {ev.target ? <Text> {truncate(ev.target, 56)}</Text> : null}
+      {running
+        ? <><Spinner color={color} /><Text> </Text></>
+        : <Text color={color}>{ev.status === 'error' ? icons.cross : icons.check} </Text>}
+      <Text dimColor={!running} color={running ? color : undefined}>{verb}</Text>
+      {ev.target ? <Text dimColor> {truncate(ev.target, 56)}</Text> : null}
     </Text>
   );
 }
@@ -208,27 +228,42 @@ export function MessageView({ msg, maxLines = 120 }: { msg: Message; maxLines?: 
 }
 
 export function ConnectorLine({ label }: { label: string }): JSX.Element {
-  return <Text dimColor>   {icons.chevron}{icons.chevron} {label}</Text>;
+  return (
+    <Box marginBottom={1}>
+      <Text dimColor>   {icons.corner}{icons.arrowDown} {label}</Text>
+    </Box>
+  );
 }
 
 // ── Live streaming turn ─────────────────────────────────────────────────
 
 export function LiveTurn({ role, subtitle, text, tools }: { role: 'mentor' | 'executor'; subtitle: string; text: string; tools: ToolEvent[] }): JSX.Element {
   const color = role === 'mentor' ? colors.mentor : colors.executor;
+  // Reset the clock each time the turn changes hands (role flips per turn).
+  const elapsed = useElapsed(role);
   const tail = text.split('\n').slice(-14);
   const recentTools = tools.slice(-6);
   const runningCount = tools.filter(t => t.status === 'running').length;
   return (
     <Box flexDirection="column">
       <Text>
-        <Text color={color}>{senderIcon(role)} </Text>
+        <Spinner color={color} />
+        <Text color={color}> {senderIcon(role)} </Text>
         <Text color={color} bold>{role.toUpperCase()}</Text>
-        <Text dimColor>  {subtitle}</Text>
+        <Text dimColor>  {subtitle}{icons.ellipsis}</Text>
+        <Text dimColor>  {formatDuration(elapsed)}</Text>
         {tools.length > 0 ? <Text dimColor>  {icons.gear} {tools.length} {tools.length === 1 ? 'call' : 'calls'}{runningCount ? '…' : ''}</Text> : null}
       </Text>
       <Box flexDirection="column" paddingLeft={1} borderStyle="single" borderColor={color} borderTop={false} borderRight={false} borderBottom={false}>
         {recentTools.map(t => <ToolLine key={t.id} ev={t} />)}
-        {text ? tail.map((l, i) => <Text key={i}>{l || ' '}</Text>) : (recentTools.length === 0 ? <Text dimColor>{icons.ellipsis} thinking</Text> : null)}
+        {text
+          ? tail.map((l, i) => (
+              <Text key={i}>
+                {l || ' '}
+                {i === tail.length - 1 ? <Text color={color}>{icons.caret}</Text> : null}
+              </Text>
+            ))
+          : (recentTools.length === 0 ? <Text dimColor><Spinner color={colors.dim} /> thinking{icons.ellipsis}</Text> : null)}
       </Box>
     </Box>
   );
@@ -240,6 +275,7 @@ export function liveSubtitle(status: string): string {
     case 'mentoring': return 'planning';
     case 'reviewing': return 'reviewing';
     case 'executing': return 'implementing';
+    case 'greeting': return 'saying hello';
     default: return 'working';
   }
 }
@@ -274,7 +310,7 @@ export function ResultPanel({ state }: { state: PairState }): JSX.Element {
     return (
       <Box flexDirection="column" borderStyle="round" borderColor={colors.warn} paddingX={1}>
         <Text color={colors.warn} bold>{icons.pause} Paused</Text>
-        <Text dimColor>iter {state.iteration}/{state.maxIterations} · /resume to continue, or a new task.</Text>
+        <Text dimColor>iter {formatIterations(state.iteration, state.maxIterations)} · /resume to continue, or a new task.</Text>
       </Box>
     );
   }

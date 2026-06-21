@@ -5,7 +5,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import { render } from 'ink-testing-library';
-import { createPairState, addMessage, prepareRun } from '../src/state.js';
+import { createPairState, addMessage, prepareRun, initializeGreetingState, addGreetingMessage } from '../src/state.js';
 import type { PairState, ToolEvent } from '../src/types.js';
 import { Banner, StatusBar, AgentBar, LiveTurn, MessageView, ResultPanel, ConnectorLine } from '../src/components.js';
 import { SlashInput, Select, SearchSelect } from '../src/inputs.js';
@@ -91,6 +91,18 @@ section('SETUP — banner + spec', <Box flexDirection="column"><Banner /><Text d
   ));
 }
 
+// 3b — Greeting smoke-test transcript (HELLO chips from both roles)
+{
+  let s = { ...base(), status: 'greeting' as const, greetingState: initializeGreetingState() };
+  s = addGreetingMessage(s, 'mentor', 'Hello executor — this is a greeting smoke-test. Are you ready?');
+  s = addMessage(s, { from: 'mentor', to: 'executor', type: 'greeting', content: 'Hello executor — this is a greeting smoke-test. Are you ready?' });
+  s = addGreetingMessage(s, 'executor', 'Hi mentor — ready when you are. No task today, just a hello.');
+  s = addMessage(s, { from: 'executor', to: 'mentor', type: 'greeting', content: 'Hi mentor — ready when you are. No task today, just a hello.' });
+  section('GREETING — hello exchange', (
+    <Box flexDirection="column">{s.messages.map(m => <MessageView key={m.id} msg={m} />)}</Box>
+  ));
+}
+
 // 4 — Result panels
 {
   let s = base();
@@ -106,6 +118,21 @@ section('PICKER — endpoint profile', (
       { label: 'GLM', value: 'glm', hint: 'open.bigmodel.cn/api/anthropic' },
       { label: 'DeepSeek', value: 'deepseek', hint: 'api.deepseek.com/anthropic' },
       { label: 'Anthropic', value: 'anthropic', hint: 'official api' },
+    ]}
+    onSubmit={() => {}}
+  />
+));
+
+// 5b — Executor endpoint picker with the "Same as Mentor" shortcut
+section('PICKER — executor endpoint (Same as Mentor)', (
+  <Select
+    message="Executor (coder & implementer) — pick endpoint"
+    items={[
+      { label: 'Same as Mentor', value: 'same', hint: 'GLM / glm-4.6' },
+      { label: 'GLM', value: 'glm', hint: 'open.bigmodel.cn/api/anthropic' },
+      { label: 'DeepSeek', value: 'deepseek', hint: 'api.deepseek.com/anthropic' },
+      { label: 'Anthropic', value: 'anthropic', hint: 'official api' },
+      { label: '+ Add an endpoint…', value: 'add', hint: 'base URL + key' },
     ]}
     onSubmit={() => {}}
   />

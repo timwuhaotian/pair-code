@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import type { PairState, ToolEvent } from './types.js';
-import { runPairEngine, killActiveTurn, type EngineCallbacks } from './process.js';
+import { runPairEngine, runGreetingSession, killActiveTurn, type EngineCallbacks } from './process.js';
 
 export interface EngineHook {
   state: PairState | null;
@@ -8,6 +8,7 @@ export interface EngineHook {
   liveTools: ToolEvent[];
   running: boolean;
   runTask: (state: PairState) => Promise<PairState>;
+  runGreeting: (state: PairState) => Promise<PairState>;
   requestStop: () => void;
   setState: (state: PairState) => void;
 }
@@ -24,6 +25,20 @@ export function useEngine(initial: PairState | null): EngineHook {
 
   const setState = useCallback((s: PairState) => setStateRaw(s), []);
 
+  // Shared callback builder so runTask and runGreeting stay in lockstep —
+  // avoids drift in how streaming state is mirrored to React.
+  const makeCallbacks = (): EngineCallbacks => ({
+    onStateUpdate: (s) => setStateRaw(s),
+    onLog: () => { /* logs are surfaced via activity; raw stderr not shown in main UI */ },
+    onActivity: () => { /* state already reflects activity */ },
+    onTextDelta: (_role, text) => { liveTextRef.current += text; },
+    onToolStart: (_role, ev) => setLiveTools(prev => [...prev, ev]),
+    onToolEnd: (_role, id, status) => setLiveTools(prev => prev.map(t => t.id === id ? { ...t, status } : t)),
+    onMessage: (s) => { setStateRaw(s); liveTextRef.current = ''; setLiveText(''); setLiveTools([]); },
+    onError: () => { /* captured into state.lastError */ },
+    shouldStop: () => stopRef.current,
+  });
+
   const runTask = useCallback(async (start: PairState): Promise<PairState> => {
     stopRef.current = false;
     setRunning(true);
@@ -33,20 +48,29 @@ export function useEngine(initial: PairState | null): EngineHook {
 
     const flush = setInterval(() => setLiveText(liveTextRef.current), 60);
 
-    const cbs: EngineCallbacks = {
-      onStateUpdate: (s) => setStateRaw(s),
-      onLog: () => { /* logs are surfaced via activity; raw stderr not shown in main UI */ },
-      onActivity: () => { /* state already reflects activity */ },
-      onTextDelta: (_role, text) => { liveTextRef.current += text; },
-      onToolStart: (_role, ev) => setLiveTools(prev => [...prev, ev]),
-      onToolEnd: (_role, id, status) => setLiveTools(prev => prev.map(t => t.id === id ? { ...t, status } : t)),
-      onMessage: (s) => { setStateRaw(s); liveTextRef.current = ''; setLiveText(''); setLiveTools([]); },
-      onError: () => { /* captured into state.lastError */ },
-      shouldStop: () => stopRef.current,
-    };
+    try {
+      const final = await runPairEngine(start, makeCallbacks());
+      return final;
+    } finally {
+      clearInterval(flush);
+      liveTextRef.current = '';
+      setLiveText('');
+      setLiveTools([]);
+      setRunning(false);
+    }
+  }, []);
+
+  const runGreeting = useCallback(async (start: PairState): Promise<PairState> => {
+    stopRef.current = false;
+    setRunning(true);
+    liveTextRef.current = '';
+    setLiveText('');
+    setLiveTools([]);
+
+    const flush = setInterval(() => setLiveText(liveTextRef.current), 60);
 
     try {
-      const final = await runPairEngine(start, cbs);
+      const final = await runGreetingSession(start, makeCallbacks());
       return final;
     } finally {
       clearInterval(flush);
@@ -62,5 +86,5 @@ export function useEngine(initial: PairState | null): EngineHook {
     killActiveTurn();
   }, []);
 
-  return { state, liveText, liveTools, running, runTask, requestStop, setState };
+  return { state, liveText, liveTools, running, runTask, runGreeting, requestStop, setState };
 }

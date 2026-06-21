@@ -4,14 +4,15 @@ import { Box, Text, Static, useApp, useInput, useStdout } from 'ink';
 import type { PairState, Message, Profile } from './types.js';
 import { loadProfiles, suggestModels, profileLabel, addEndpoint, forgetProfile, persistedProfiles } from './providers.js';
 import { configPath } from './config.js';
-import { createPairState, addMessage } from './state.js';
+import { createPairState, addMessage, initializeGreetingState } from './state.js';
 import { useEngine } from './useEngine.js';
 import { Select, SearchSelect, TextPrompt, SlashInput, type SlashCommand, type SearchItem } from './inputs.js';
 import { Banner, StatusBar, AgentBar, LiveTurn, MessageView, ResultPanel, ConnectorLine, liveSubtitle } from './components.js';
-import { colors, icons, truncate } from './ui.js';
+import { colors, icons, truncate, formatIterations } from './ui.js';
 
 const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'task', description: 'Start a new task with the current agents' },
+  { name: 'hello', description: 'Greeting smoke-test, then finish' },
   { name: 'resume', description: 'Continue a paused session' },
   { name: 'config', description: 'Configure endpoints, models & saved credentials' },
   { name: 'mentor', description: 'Re-select mentor profile & model' },
@@ -29,6 +30,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
 interface RolePick { profileName: string; baseUrl: string; model: string }
 
 const ADD_ENDPOINT = '__add_endpoint__';
+const SAME_AS_MENTOR = '__same_as_mentor__';
 
 // ── Endpoint entry (base URL + key, held in memory only) ─────────────────
 
@@ -87,6 +89,10 @@ function RolePicker(props: {
   roleSubtitle: string;
   profiles: Profile[];
   defaultProfileIndex: number;
+  /** When set, offers a "Same as Mentor" shortcut that reuses the given pick. */
+  sameAs?: { pick: RolePick; hint: string } | null;
+  /** Highlight the "Same as Mentor" row by default (first-time setup). */
+  highlightSameAs?: boolean;
   onDone: (pick: RolePick) => void;
   onCancel?: () => void;
 }): JSX.Element {
@@ -110,12 +116,19 @@ function RolePicker(props: {
     return (
       <Select
         message={`${props.roleLabel} (${props.roleSubtitle}) — pick endpoint`}
-        initialIndex={props.defaultProfileIndex}
+        initialIndex={props.sameAs
+          ? (props.highlightSameAs ? 0 : props.defaultProfileIndex + 1)
+          : props.defaultProfileIndex}
         items={[
+          ...(props.sameAs ? [{ label: 'Same as Mentor', value: SAME_AS_MENTOR, hint: props.sameAs.hint }] : []),
           ...props.profiles.map(p => ({ label: p.label, value: p.name, hint: p.baseUrl || 'official api' })),
           { label: '+ Add an endpoint…', value: ADD_ENDPOINT, hint: 'base URL + key' },
         ]}
-        onSubmit={(name) => name === ADD_ENDPOINT ? setAdding(true) : setChosen(props.profiles.find(p => p.name === name)!)}
+        onSubmit={(name) => {
+          if (name === SAME_AS_MENTOR) { props.onDone(props.sameAs!.pick); return; }
+          if (name === ADD_ENDPOINT) { setAdding(true); return; }
+          setChosen(props.profiles.find(p => p.name === name)!);
+        }}
         onCancel={props.onCancel}
       />
     );
@@ -210,6 +223,8 @@ function SetupWizard(props: {
       <RolePicker
         roleLabel="Executor" roleSubtitle="coder & implementer"
         profiles={profiles} defaultProfileIndex={Math.min(1, profiles.length - 1)}
+        sameAs={mentorRef.current ? { pick: mentorRef.current, hint: `${profileLabel(mentorRef.current.profileName)} / ${mentorRef.current.model}` } : null}
+        highlightSameAs
         onCancel={() => { mentorRef.current = null; setStep('mentor'); }}
         onDone={(pick) => {
           const mentor = mentorRef.current!;
@@ -320,6 +335,24 @@ function freshTask(prev: PairState, spec: string): PairState {
   return s;
 }
 
+// A from-scratch greeting smoke-test: keep the configured endpoints/models but
+// drop prior sessionIds so each role starts a clean session, reset iteration,
+// and seed greetingState. No task spec, no messages, no modified files.
+function freshGreeting(prev: PairState): PairState {
+  return {
+    ...createPairState({
+      directory: prev.directory,
+      spec: '',
+      mentor: { role: 'mentor', profileName: prev.mentor.profileName, baseUrl: prev.mentor.baseUrl, model: prev.mentor.model },
+      executor: { role: 'executor', profileName: prev.executor.profileName, baseUrl: prev.executor.baseUrl, model: prev.executor.model },
+      maxIterations: prev.maxIterations,
+    }),
+    status: 'greeting',
+    turn: 'mentor',
+    greetingState: initializeGreetingState(),
+  };
+}
+
 function Session(props: { initialState: PairState }): JSX.Element {
   const { exit } = useApp();
   const { write } = useStdout();
@@ -362,6 +395,7 @@ function Session(props: { initialState: PairState }): JSX.Element {
   useInput((_i, key) => { if (key.escape) engine.requestStop(); }, { isActive: engine.running && !overlay });
 
   const runReplace = async (next: PairState) => { engine.setState(next); await engine.runTask(next); };
+  const runGreeting = async (next: PairState) => { engine.setState(next); await engine.runGreeting(next); };
 
   const handleLine = (line: string) => {
     setNotice(null);
@@ -374,6 +408,10 @@ function Session(props: { initialState: PairState }): JSX.Element {
       case 'mentor': setOverlay('mentor'); break;
       case 'runner': setOverlay('runner'); break;
       case 'task': if (arg) void runReplace(freshTask(state, arg)); else setNotice(<Text dimColor>Usage: /task &lt;spec&gt;</Text>); break;
+      case 'hello':
+        if (engine.running) setNotice(<Text dimColor>Finish or stop the current turn before /hello.</Text>);
+        else void runGreeting(freshGreeting(state));
+        break;
       case 'resume':
         if (state.status === 'paused') void engine.runTask({ ...state, status: 'mentoring' });
         else setNotice(<Text dimColor>Nothing to resume — session is {state.status}.</Text>);
@@ -383,7 +421,7 @@ function Session(props: { initialState: PairState }): JSX.Element {
           <Text><Text color={colors.mentor}>{icons.mentor} Mentor   </Text>{profileLabel(state.mentor.profileName)} <Text dimColor>/</Text> {state.mentor.model}</Text>
           <Text><Text color={colors.executor}>{icons.executor} Executor </Text>{profileLabel(state.executor.profileName)} <Text dimColor>/</Text> {state.executor.model}</Text>
         </Box>); break;
-      case 'status': setNotice(<Text dimColor>{state.status} · iter {state.iteration}/{state.maxIterations} · {state.messages.length} messages · {state.modifiedFiles.length} files</Text>); break;
+      case 'status': setNotice(<Text dimColor>{state.status} · iter {formatIterations(state.iteration, state.maxIterations)} · {state.messages.length} messages · {state.modifiedFiles.length} files</Text>); break;
       case 'files': setNotice(
         state.modifiedFiles.length === 0 ? <Text dimColor>No files modified yet.</Text> :
         <Box flexDirection="column">{state.modifiedFiles.map((f, i) => <Text key={i}><Text color={colors.success}>{f.status}</Text>  {f.path}</Text>)}</Box>); break;
@@ -418,6 +456,9 @@ function Session(props: { initialState: PairState }): JSX.Element {
           roleSubtitle={overlay === 'mentor' ? 'planner & reviewer' : 'coder & implementer'}
           profiles={profiles}
           defaultProfileIndex={Math.max(0, profiles.findIndex(p => p.name === state[role].profileName))}
+          sameAs={overlay === 'runner'
+            ? { pick: { profileName: state.mentor.profileName, baseUrl: state.mentor.baseUrl, model: state.mentor.model }, hint: `${profileLabel(state.mentor.profileName)} / ${state.mentor.model}` }
+            : null}
           onCancel={() => setOverlay(null)}
           onDone={(pick) => {
             const next = { ...state, [role]: { ...state[role], profileName: pick.profileName, baseUrl: pick.baseUrl, model: pick.model, sessionId: undefined } };
