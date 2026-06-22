@@ -68,7 +68,7 @@ Don't mix concerns: no state mutation in components, no rendering in `state.ts`,
 
 Breaking any of these will silently corrupt the loop:
 
-- **Only the Mentor may emit `TASK_COMPLETE`**, on its own line. The Executor's system-prompt append forbids it. Without it the loop runs to `maxIterations` (default 20).
+- **Only the Mentor may emit `TASK_COMPLETE`**, on its own line. The Executor's system-prompt append forbids it. Without it the loop runs until `maxIterations` (default: unlimited / `Infinity` — a finite cap can be passed explicitly) or the user stops it.
 - **Roles are asymmetric and enforced via the SDK.** Executor: `permissionMode: 'bypassPermissions'`, full tools. Mentor: read-only — `allowedTools: ['Read','Grep','Glob']` + everything else `disallowedTools`. The mentor inspects to verify but can never mutate. The Executor attaches its own build/test output as evidence because the mentor cannot run commands.
 - **Turn timeout is 10 minutes** (`TURN_TIMEOUT_MS`); on timeout the turn's `AbortController` aborts and the active `query` is interrupted.
 - **Mentor reviews must include the structured JSON block** (`{"verdict":…, "risk":…, "nextStep":{…}}`). `components.tsx` parses it into a verdict chip; don't change the contract without updating `parseVerdict`.

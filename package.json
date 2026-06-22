@@ -19,7 +19,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/timwuhaotian/pair-cli.git"
+    "url": "git+https://github.com/timwuhaotian/pair-cli.git"
+  },
+  "homepage": "https://github.com/timwuhaotian/pair-cli#readme",
+  "bugs": {
+    "url": "https://github.com/timwuhaotian/pair-cli/issues"
   },
   "bin": {
     "pair-code": "./dist/index.js",

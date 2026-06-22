@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `SECURITY.md` — security policy with private vulnerability reporting and a note on how credentials are handled.
+- Dependabot config for weekly npm + GitHub Actions dependency updates.
+- `.editorconfig` and `.nvmrc` (Node 20) for consistent contributor setup.
+- `bugs` and `homepage` fields in `package.json`.
+
+### Changed
+- `LICENSE` now contains the full Apache-2.0 license text (previously the short notice only).
+- Release workflow publishes with [npm provenance](https://docs.npmjs.com/generating-provenance-statements) and now wires up registry auth correctly.
+- Standardized the default branch on `main`.
+
+### Fixed
+- README quick-start used `pair-code profiles`; the subcommand is `pair-code providers`.
+- ESLint custom rules now also apply to `.tsx` files (previously `.ts` only).
+
 ## [0.2.0] - 2026-06-22
 
 ### Added

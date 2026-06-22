@@ -12,7 +12,7 @@
   <a href="https://www.npmjs.com/package/pair-code"><img src="https://img.shields.io/npm/v/pair-code?color=cb007d&label=npm" alt="npm version" /></a>
   <img src="https://img.shields.io/badge/node-%E2%89%A520-339933" alt="node" />
   <img src="https://img.shields.io/github/license/timwuhaotian/pair-cli?color=blue" alt="license" />
-  <a href="https://github.com/timwuhaotian/pair-cli/actions"><img src="https://img.shields.io/github/actions/workflow/status/timwuhaotian/pair-cli/release.yml?label=release" alt="release" /></a>
+  <a href="https://github.com/timwuhaotian/pair-cli/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/timwuhaotian/pair-cli/ci.yml?branch=main&label=ci" alt="CI status" /></a>
 </p>
 
 <p align="center">
@@ -46,7 +46,7 @@ pair-code . "Fix the login bug in auth.ts"
 pair-code ~/projects/api "Add rate limiting middleware"
 
 # List configured endpoint profiles
-pair-code profiles
+pair-code providers
 ```
 
 ## How It Works
@@ -183,11 +183,18 @@ npx tsx scripts/preview.tsx
 
 ## Contributing
 
-Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines, and
+please review our [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Security
+
+API keys are kept in process memory unless you explicitly opt in to saving them
+(`0600`, owner-only). To report a vulnerability, see [SECURITY.md](SECURITY.md) —
+please don't open a public issue for security reports.
 
 ## License
 
-[Apache-2.0](LICENSE)
+[Apache-2.0](LICENSE) © timwuhaotian
 
 ## Acknowledgements
 
