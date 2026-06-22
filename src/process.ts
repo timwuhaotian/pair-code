@@ -283,6 +283,14 @@ function createEngineLoop(initial: PairState, callbacks: EngineCallbacks): Engin
   return loop;
 }
 
+/** Apply a turn's sessionId + tokenUsage back into the runtime for the given role. */
+function applyTurnResult(state: PairState, role: 'mentor' | 'executor', result: TurnResult): PairState {
+  if (!result.sessionId) return state;
+  return role === 'mentor'
+    ? { ...state, mentor: { ...state.mentor, sessionId: result.sessionId, tokenUsage: result.tokenUsage } }
+    : { ...state, executor: { ...state.executor, sessionId: result.sessionId, tokenUsage: result.tokenUsage } };
+}
+
 export async function runPairEngine(
   initialState: PairState,
   callbacks: EngineCallbacks,
@@ -306,7 +314,7 @@ export async function runPairEngine(
       onLog('mentor', 'Planning…');
       const mentorResult = await runTurn(loop.state.directory, 'mentor', loop.state.mentor, HANDOFF_PROMPTS.initialMentor(spec), turnCallbacks('mentor'));
 
-      if (mentorResult.sessionId) loop.state = { ...loop.state, mentor: { ...loop.state.mentor, sessionId: mentorResult.sessionId, tokenUsage: mentorResult.tokenUsage } };
+      loop.state = applyTurnResult(loop.state, 'mentor', mentorResult);
       loop.state = addMessage(loop.state, { from: 'mentor', to: 'executor', type: 'plan', content: mentorResult.output });
       loop.state = updateActivity(loop.state, 'mentor', 'idle', 'Planning complete');
       update(loop.state);
@@ -330,7 +338,7 @@ export async function runPairEngine(
       onLog('executor', 'Executing…');
       const executorResult = await runTurn(loop.state.directory, 'executor', loop.state.executor, HANDOFF_PROMPTS.mentorToExecutor(latestPlan, spec), turnCallbacks('executor'));
 
-      if (executorResult.sessionId) loop.state = { ...loop.state, executor: { ...loop.state.executor, sessionId: executorResult.sessionId, tokenUsage: executorResult.tokenUsage } };
+      loop.state = applyTurnResult(loop.state, 'executor', executorResult);
       loop.state = addMessage(loop.state, { from: 'executor', to: 'mentor', type: 'result', content: executorResult.output });
       loop.state = updateActivity(loop.state, 'executor', 'idle', 'Execution complete');
       update(loop.state);
@@ -355,7 +363,7 @@ export async function runPairEngine(
       onLog('mentor', 'Reviewing…');
       const reviewResult = await runTurn(loop.state.directory, 'mentor', loop.state.mentor, HANDOFF_PROMPTS.executorToMentor(executorResult.output, spec, history), turnCallbacks('mentor'));
 
-      if (reviewResult.sessionId) loop.state = { ...loop.state, mentor: { ...loop.state.mentor, sessionId: reviewResult.sessionId, tokenUsage: reviewResult.tokenUsage } };
+      loop.state = applyTurnResult(loop.state, 'mentor', reviewResult);
 
       const mentorWantsFinish = hasFinishSignal(reviewResult.output);
       loop.state = addMessage(loop.state, { from: 'mentor', to: 'executor', type: 'acceptance', content: reviewResult.output });
@@ -419,7 +427,7 @@ export async function runGreetingSession(
 
     onLog('mentor', 'Saying hello…');
     const mentorHello = await runTurn(loop.state.directory, 'mentor', loop.state.mentor, GREETING_PROMPTS.mentorHello(), turnCallbacks('mentor'));
-    if (mentorHello.sessionId) loop.state = { ...loop.state, mentor: { ...loop.state.mentor, sessionId: mentorHello.sessionId, tokenUsage: mentorHello.tokenUsage } };
+    loop.state = applyTurnResult(loop.state, 'mentor', mentorHello);
     loop.state = addGreetingMessage(loop.state, 'mentor', mentorHello.output);
     loop.state = addMessage(loop.state, { from: 'mentor', to: 'executor', type: 'greeting', content: mentorHello.output });
     loop.state = updateActivity(loop.state, 'mentor', 'idle', 'Greeting sent');
@@ -435,7 +443,7 @@ export async function runGreetingSession(
 
     onLog('executor', 'Greeting back…');
     const executorHello = await runTurn(loop.state.directory, 'executor', loop.state.executor, GREETING_PROMPTS.executorHello(mentorHello.output), turnCallbacks('executor'));
-    if (executorHello.sessionId) loop.state = { ...loop.state, executor: { ...loop.state.executor, sessionId: executorHello.sessionId, tokenUsage: executorHello.tokenUsage } };
+    loop.state = applyTurnResult(loop.state, 'executor', executorHello);
     loop.state = addGreetingMessage(loop.state, 'executor', executorHello.output);
     loop.state = addMessage(loop.state, { from: 'executor', to: 'mentor', type: 'greeting', content: executorHello.output });
     loop.state = updateActivity(loop.state, 'executor', 'idle', 'Ready');
@@ -451,7 +459,7 @@ export async function runGreetingSession(
 
     onLog('mentor', 'Acknowledging…');
     const mentorAck = await runTurn(loop.state.directory, 'mentor', loop.state.mentor, GREETING_PROMPTS.mentorFinish(executorHello.output), turnCallbacks('mentor'));
-    if (mentorAck.sessionId) loop.state = { ...loop.state, mentor: { ...loop.state.mentor, sessionId: mentorAck.sessionId, tokenUsage: mentorAck.tokenUsage } };
+    loop.state = applyTurnResult(loop.state, 'mentor', mentorAck);
     loop.state = addMessage(loop.state, { from: 'mentor', to: 'executor', type: 'greeting', content: mentorAck.output });
     loop.state = updateActivity(loop.state, 'mentor', 'idle', 'Acknowledged');
     update(loop.state);

@@ -13,7 +13,7 @@ const FINISH_NORMALIZED = MENTOR_FINISH_SIGNAL.replace(NORMALIZE_RE, '');
 const MAX_HISTORY_MESSAGES = 10;
 const MAX_HISTORY_MESSAGE_CHARS = 4000;
 
-export function nowMs(): number {
+function nowMs(): number {
   return Date.now();
 }
 

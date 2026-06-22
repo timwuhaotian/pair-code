@@ -412,10 +412,13 @@ function Session(props: { initialState: PairState }): JSX.Element {
         if (engine.running) setNotice(<Text dimColor>Finish or stop the current turn before /hello.</Text>);
         else void runGreeting(freshGreeting(state));
         break;
-      case 'resume':
-        if (state.status === 'paused') void engine.runTask({ ...state, status: 'mentoring' });
-        else setNotice(<Text dimColor>Nothing to resume — session is {state.status}.</Text>);
+      case 'resume': {
+        if (state.status !== 'paused') { setNotice(<Text dimColor>Nothing to resume — session is {state.status}.</Text>); break; }
+        const next = { ...state, status: 'mentoring' as const };
+        engine.setState(next);
+        void engine.runTask(next);
         break;
+      }
       case 'model': setNotice(
         <Box flexDirection="column">
           <Text><Text color={colors.mentor}>{icons.mentor} Mentor   </Text>{profileLabel(state.mentor.profileName)} <Text dimColor>/</Text> {state.mentor.model}</Text>

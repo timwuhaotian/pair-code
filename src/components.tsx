@@ -180,7 +180,7 @@ function senderIcon(from: string): string {
 interface Verdict { verdict?: string; risk?: string; confidence?: number; summary?: string }
 
 function parseVerdict(content: string): Verdict | null {
-  const m = content.match(/```json\s*([\s\S]*?)```/);
+  const m = content.match(/```json\s*([\s\S]*?)```/i);
   if (!m) return null;
   try {
     const o = JSON.parse(m[1]) as Record<string, unknown>;
@@ -212,7 +212,7 @@ function VerdictChip({ v }: { v: Verdict }): JSX.Element {
 export function MessageView({ msg, maxLines = 120 }: { msg: Message; maxLines?: number }): JSX.Element {
   const color = senderColor(msg.from);
   const verdict = msg.type === 'acceptance' ? parseVerdict(msg.content) : null;
-  const bodyText = (verdict ? msg.content.replace(/```json[\s\S]*?```/g, '').trim() : msg.content) || (verdict?.summary ?? '');
+  const bodyText = (verdict ? msg.content.replace(/```json[\s\S]*?```/gi, '').trim() : msg.content) || (verdict?.summary ?? '');
   const lines = bodyText.split('\n');
   const shown = lines.length > maxLines ? lines.slice(0, maxLines) : lines;
   const clipped = lines.length - shown.length;
