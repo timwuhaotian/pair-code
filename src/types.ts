@@ -1,8 +1,8 @@
 export type AgentRole = 'mentor' | 'executor';
 export type MessageSender = 'mentor' | 'executor' | 'human';
-export type MessageType = 'plan' | 'feedback' | 'progress' | 'result' | 'question' | 'acceptance' | 'handoff' | 'greeting';
-export type PairStatus = 'idle' | 'mentoring' | 'executing' | 'reviewing' | 'paused' | 'awaiting_human_review' | 'error' | 'finished' | 'greeting';
-export type ActivityPhase = 'idle' | 'thinking' | 'using_tools' | 'responding' | 'waiting' | 'error' | 'stalled';
+export type MessageType = 'plan' | 'feedback' | 'result' | 'acceptance' | 'handoff' | 'greeting';
+export type PairStatus = 'idle' | 'mentoring' | 'executing' | 'reviewing' | 'paused' | 'error' | 'finished' | 'greeting';
+export type ActivityPhase = 'idle' | 'thinking' | 'using_tools' | 'responding' | 'waiting' | 'error';
 
 /**
  * An Anthropic-compatible endpoint a role binds to. It carries the base URL +
@@ -34,7 +34,6 @@ export interface AgentConfig {
   /** Display copy of the endpoint URL (no secret). */
   baseUrl: string;
   model: string;
-  reasoningEffort?: 'low' | 'medium' | 'high';
 }
 
 export interface Message {
@@ -76,7 +75,6 @@ export interface AgentRuntime {
   /** Endpoint URL copy for display (no secret). */
   baseUrl: string;
   model: string;
-  reasoningEffort?: string;
   sessionId?: string;
   activity: AgentActivity;
   tokenUsage?: TokenUsage;

@@ -113,7 +113,7 @@ export function StatusBar({ state, elapsedMs }: { state: PairState; elapsedMs: n
 
 const PHASE_LABEL: Record<ActivityPhase, string> = {
   idle: 'idle', thinking: 'thinking', using_tools: 'using tools', responding: 'writing',
-  waiting: 'waiting', error: 'error', stalled: 'stalled',
+  waiting: 'waiting', error: 'error',
 };
 
 function AgentCell({ runtime, role, active }: { runtime: AgentRuntime; role: 'mentor' | 'executor'; active: boolean }): JSX.Element {
@@ -167,7 +167,7 @@ export function ToolLine({ ev }: { ev: ToolEvent }): JSX.Element {
 // ── Messages ────────────────────────────────────────────────────────────
 
 const TYPE_LABEL: Record<string, string> = {
-  plan: 'PLAN', result: 'RESULT', acceptance: 'REVIEW', handoff: 'HANDOFF', feedback: 'TASK', greeting: 'HELLO', progress: 'NOTE', question: 'ASK',
+  plan: 'PLAN', result: 'RESULT', acceptance: 'REVIEW', handoff: 'HANDOFF', feedback: 'TASK', greeting: 'HELLO',
 };
 
 function senderColor(from: string): string {

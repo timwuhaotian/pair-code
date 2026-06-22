@@ -5,18 +5,16 @@ import { colors, icons } from './ui.js';
 
 // ── Fuzzy match ─────────────────────────────────────────────────────────
 
-export interface FuzzyResult { matched: boolean; score: number; indices: Set<number> }
+export interface FuzzyResult { matched: boolean; score: number }
 
 export function fuzzyMatch(query: string, target: string): FuzzyResult {
   const q = query.toLowerCase();
   const t = target.toLowerCase();
-  const indices = new Set<number>();
   let qi = 0;
   let score = 0;
   let prev = -2;
   for (let ti = 0; ti < t.length && qi < q.length; ti++) {
     if (t[ti] === q[qi]) {
-      indices.add(ti);
       if (ti === prev + 1) score += 5;
       if (ti === 0) score += 10;
       score += 1;
@@ -24,7 +22,7 @@ export function fuzzyMatch(query: string, target: string): FuzzyResult {
       qi++;
     }
   }
-  return { matched: qi === q.length, score, indices };
+  return { matched: qi === q.length, score };
 }
 
 // ── Select ──────────────────────────────────────────────────────────────

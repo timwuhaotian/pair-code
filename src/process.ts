@@ -313,7 +313,9 @@ export async function runPairEngine(
       onMessage(loop.state);
       latestPlan = mentorResult.output;
     } else {
-      const lastMentorMsg = [...loop.state.messages].reverse().find(m => m.from === 'mentor');
+      // Skip 'handoff' marker messages — they carry only a UI label ("Passing
+      // back to executor with feedback"), not an actionable plan.
+      const lastMentorMsg = [...loop.state.messages].reverse().find(m => m.from === 'mentor' && m.type !== 'handoff');
       latestPlan = lastMentorMsg?.content ?? `Continue the task: ${spec}`;
       onLog('mentor', 'Resuming…');
     }
