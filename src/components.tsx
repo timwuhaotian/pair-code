@@ -184,8 +184,15 @@ function parseVerdict(content: string): Verdict | null {
   if (!m) return null;
   try {
     const o = JSON.parse(m[1]) as Record<string, unknown>;
-    if (!o.verdict && !o.risk) return null;
-    return { verdict: o.verdict as string, risk: o.risk as string, confidence: o.confidence as number, summary: o.summary as string };
+    const verdict = typeof o.verdict === 'string' ? o.verdict : undefined;
+    const risk = typeof o.risk === 'string' ? o.risk : undefined;
+    if (!verdict && !risk) return null;
+    return {
+      verdict,
+      risk,
+      confidence: typeof o.confidence === 'number' ? o.confidence : undefined,
+      summary: typeof o.summary === 'string' ? o.summary : undefined,
+    };
   } catch { return null; }
 }
 

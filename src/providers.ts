@@ -1,5 +1,5 @@
 import type { Profile, ResolvedProfile } from './types.js';
-import { readConfig, writeConfig } from './config.js';
+import { readConfig, writeConfig, type PairConfig } from './config.js';
 
 /**
  * Profiles come from three sources, in precedence order:
@@ -150,9 +150,16 @@ export function loadProfiles(): Profile[] {
   return profiles;
 }
 
-/** Saved profiles from the on-disk config, secrets stripped. */
+/**
+ * Saved profiles from the on-disk config, secrets stripped. If the config is
+ * corrupted, degrade to an empty list rather than crashing — the write path
+ * (persistProfile/forgetProfile) still calls readConfig() directly and will
+ * throw, preventing an overwrite that destroys the broken file.
+ */
 function loadPersistedProfiles(): Profile[] {
-  return Object.entries(readConfig().profiles).map(([name, p]) => ({
+  let cfg: PairConfig;
+  try { cfg = readConfig(); } catch { return []; }
+  return Object.entries(cfg.profiles).map(([name, p]) => ({
     name,
     label: humanizeProfileName(name),
     baseUrl: p.baseUrl,

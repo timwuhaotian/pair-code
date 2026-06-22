@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { mkdirSync, readFileSync, writeFileSync, renameSync, chmodSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, chmodSync, existsSync } from 'node:fs';
 
 /**
  * Opt-in on-disk config. Unlike env/session profiles (process memory only),
@@ -33,17 +33,21 @@ export function configPath(): string {
   return join(configDir(), 'config.json');
 }
 
-/** Read the saved config; returns an empty config if missing or unreadable. */
+/**
+ * Read the saved config. Returns an empty config only when the file doesn't
+ * exist (first run). If the file exists but is corrupted, the error propagates
+ * — catching it here would cause the next writeConfig() to silently overwrite
+ * the broken file and destroy all saved credentials.
+ */
 export function readConfig(): PairConfig {
-  try {
-    const parsed = JSON.parse(readFileSync(configPath(), 'utf-8')) as Partial<PairConfig>;
-    return {
-      version: typeof parsed.version === 'number' ? parsed.version : CONFIG_VERSION,
-      profiles: isRecord(parsed.profiles) ? (parsed.profiles as Record<string, StoredProfile>) : {},
-    };
-  } catch {
-    return { version: CONFIG_VERSION, profiles: {} };
-  }
+  const path = configPath();
+  if (!existsSync(path)) return { version: CONFIG_VERSION, profiles: {} };
+
+  const parsed = JSON.parse(readFileSync(path, 'utf-8')) as Partial<PairConfig>;
+  return {
+    version: typeof parsed.version === 'number' ? parsed.version : CONFIG_VERSION,
+    profiles: isRecord(parsed.profiles) ? (parsed.profiles as Record<string, StoredProfile>) : {},
+  };
 }
 
 /**

@@ -43,7 +43,7 @@ export function Select<T>(props: {
   useInput((_input, key) => {
     if (key.upArrow) setIndex(i => Math.max(0, i - 1));
     else if (key.downArrow) setIndex(i => Math.min(props.items.length - 1, i + 1));
-    else if (key.return) props.onSubmit(props.items[index].value);
+    else if (key.return) { const item = props.items[index]; if (item) props.onSubmit(item.value); }
     else if (key.escape && props.onCancel) props.onCancel();
   });
 
