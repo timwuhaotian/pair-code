@@ -10,6 +10,32 @@ Two AI agents — a **Mentor** (planner/reviewer) and an **Executor** (coder) �
 npm install -g pair-code
 ```
 
+## How it works
+
+Both roles are driven in-process through the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript). Each role binds to an **Anthropic-compatible endpoint** (base URL + API key), so any provider exposing that protocol works:
+
+| Provider | Base URL | Notes |
+|----------|----------|-------|
+| Anthropic (official) | `https://api.anthropic.com` | Set `ANTHROPIC_API_KEY` |
+| DeepSeek | `https://api.deepseek.com` | |
+| GLM / Zhipu | `https://open.bigmodel.cn/api/paas/v4` | |
+| Kimi (Moonshot) | `https://api.moonshot.cn/anthropic` | |
+| Qwen (DashScope) | `https://dashscope.aliyuncs.com/api/v2` | |
+| MiniMax | `https://api.minimaxi.com/anthropic` | |
+| OpenRouter | `https://openrouter.ai/api/v1` | |
+| LiteLLM gateway | your gateway URL | |
+| Any Anthropic-compatible API | your URL | |
+
+Configure endpoints via environment variables:
+
+```bash
+PAIR_PROFILE_<NAME>_BASE_URL   # Anthropic-compatible endpoint
+PAIR_PROFILE_<NAME>_KEY        # API key / bearer token
+PAIR_PROFILE_<NAME>_MODEL      # default model id (optional)
+```
+
+…or use the standard `ANTHROPIC_API_KEY` (+ optional `ANTHROPIC_BASE_URL`). You can also enter an endpoint interactively at launch and optionally save it to disk (chmod 600).
+
 ## Usage
 
 ```bash
@@ -19,35 +45,33 @@ pair-code . "Fix the login bug in auth.ts"
 # Run in a specific project
 pair-code ~/projects/api "Add rate limiting middleware"
 
-# Check which AI providers are installed
-pair-code providers
+# List configured endpoint profiles
+pair-code profiles
 ```
 
-## How it works
+## Pair workflow
 
 1. **Mentor** analyzes your task and creates an implementation plan
 2. **Executor** implements the plan, making code changes
 3. **Mentor** reviews the changes, checking for correctness and quality
 4. They loop until the task is complete or the iteration budget is hit
 
-## Supported Providers
-
-| Provider | CLI | Install |
-|----------|-----|---------|
-| Claude Code | `claude` | `npm i -g @anthropic-ai/claude-code` |
-| OpenCode | `opencode` | `go install github.com/opencode-ai/opencode@latest` |
-| Codex | `codex` | `npm i -g @openai/codex` |
-| Gemini | `gemini` | Install via Google |
-
 ## Session Commands
 
 | Command | Description |
 |---------|-------------|
-| `/help` | Show available commands |
-| `/status` | Show pair status |
+| `/task` | Start a new task with the current agents |
+| `/resume` | Continue a paused session |
+| `/config` | Configure endpoints, models & saved credentials |
+| `/mentor` | Re-select mentor profile & model |
+| `/runner` | Re-select executor profile & model |
+| `/model` | Show current model configuration |
+| `/status` | Show pair status & iteration info |
 | `/files` | List modified files |
-| `/log` | Show full message history |
-| `/pause` | Pause the session |
+| `/diff` | Show git diff summary |
+| `/profiles` | List configured endpoint profiles |
+| `/clear` | Clear the screen |
+| `/help` | Show available commands |
 | `/quit` | Exit pair-code |
 
 ## License
