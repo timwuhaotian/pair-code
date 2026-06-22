@@ -160,6 +160,23 @@ function loadPersistedProfiles(): Profile[] {
   }));
 }
 
+/**
+ * Scan env vars for the API key of a profile by case-insensitive name match.
+ * We can't simply reconstruct `PAIR_PROFILE_${name.toUpperCase()}_KEY` because
+ * loadProfiles() lowercases the stored name, and the original env var may have
+ * been mixed-case (e.g. PAIR_PROFILE_MyService_KEY) which toUpperCase() can't
+ * recover on case-sensitive systems.
+ */
+function findEnvKey(profileName: string): string | undefined {
+  const target = profileName.toLowerCase();
+  for (const key of Object.keys(process.env)) {
+    if (!key.startsWith(PROFILE_PREFIX) || !key.endsWith('_KEY')) continue;
+    const raw = key.slice(PROFILE_PREFIX.length, key.length - '_KEY'.length);
+    if (raw.toLowerCase() === target) return envValue(key);
+  }
+  return undefined;
+}
+
 /** Resolve a profile *with* its secret, for use at turn time. */
 export function resolveProfile(name: string): ResolvedProfile | undefined {
   const session = sessionProfiles.get(name);
@@ -170,7 +187,7 @@ export function resolveProfile(name: string): ResolvedProfile | undefined {
   // Environment takes precedence over a saved key with the same name.
   const envKey = name === 'anthropic'
     ? envValue('ANTHROPIC_API_KEY')
-    : envValue(`${PROFILE_PREFIX}${name.toUpperCase()}_KEY`);
+    : findEnvKey(name);
   if (envKey) return { ...base, apiKey: envKey };
 
   const stored = readConfig().profiles[name];

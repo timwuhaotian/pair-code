@@ -103,7 +103,7 @@ export interface PairState {
 
 export interface ModifiedFile {
   path: string;
-  status: 'A' | 'M' | 'D' | 'R' | '??';
+  status: 'A' | 'M' | 'D' | 'R' | 'C' | 'T' | '??';
 }
 
 export interface CreatePairInput {

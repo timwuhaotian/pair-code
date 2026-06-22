@@ -234,133 +234,158 @@ export interface EngineCallbacks {
   shouldStop: () => boolean;
 }
 
-export async function runPairEngine(
-  initialState: PairState,
-  callbacks: EngineCallbacks,
-): Promise<PairState> {
-  let state = initialState;
-  const { onStateUpdate, onLog, onActivity, onTextDelta, onToolStart, onToolEnd, onMessage, onError, shouldStop } = callbacks;
+/**
+ * Shared mutable state + helpers for the engine loops. Both runPairEngine and
+ * runGreetingSession need the same turn-callback bridging and stop-checking
+ * logic — extracting them here eliminates a 25-line copy and keeps the two
+ * loops in lockstep if the contract changes.
+ */
+interface EngineLoop {
+  state: PairState;
+  update(s: PairState): void;
+  turnCallbacks(role: 'mentor' | 'executor'): TurnCallbacks;
+  checkStop(): boolean;
+}
 
-  const update = (s: PairState) => { state = s; onStateUpdate(s); };
+function createEngineLoop(initial: PairState, callbacks: EngineCallbacks): EngineLoop {
+  const loop = { state: initial } as EngineLoop;
+  const { onActivity, onTextDelta, onToolStart, onToolEnd, onLog, shouldStop, onStateUpdate } = callbacks;
 
-  const turnCallbacks = (role: 'mentor' | 'executor'): TurnCallbacks => ({
+  loop.update = (s: PairState) => { loop.state = s; onStateUpdate(s); };
+
+  loop.turnCallbacks = (role: 'mentor' | 'executor'): TurnCallbacks => ({
     onTextDelta: (t) => onTextDelta(role, t),
     onToolStart: (ev) => onToolStart(role, ev),
     onToolEnd: (id, status) => onToolEnd(role, id, status),
     onSessionId: (id) => {
-      state = role === 'mentor'
-        ? { ...state, mentor: { ...state.mentor, sessionId: id } }
-        : { ...state, executor: { ...state.executor, sessionId: id } };
+      loop.state = role === 'mentor'
+        ? { ...loop.state, mentor: { ...loop.state.mentor, sessionId: id } }
+        : { ...loop.state, executor: { ...loop.state.executor, sessionId: id } };
     },
-    onActivity: (phase, label) => { state = updateActivity(state, role, phase, label); onActivity(role, phase, label); update(state); },
+    onActivity: (phase, label) => {
+      loop.state = updateActivity(loop.state, role, phase, label);
+      onActivity(role, phase, label);
+      loop.update(loop.state);
+    },
     onLog: (line) => onLog(role, line),
   });
 
-  const checkStop = (): boolean => {
+  loop.checkStop = (): boolean => {
     if (shouldStop()) {
       killActiveTurn();
-      state = setPairStatus(state, 'paused', 'Stopped by user');
-      update(state);
+      loop.state = setPairStatus(loop.state, 'paused', 'Stopped by user');
+      loop.update(loop.state);
       return true;
     }
     return false;
   };
 
-  const isResumption = !!state.mentor.sessionId && state.iteration > 0;
-  if (!isResumption) state = { ...state, turn: 'mentor' };
+  return loop;
+}
+
+export async function runPairEngine(
+  initialState: PairState,
+  callbacks: EngineCallbacks,
+): Promise<PairState> {
+  const loop = createEngineLoop(initialState, callbacks);
+  const { update, turnCallbacks, checkStop } = loop;
+  const { onLog, onMessage, onError } = callbacks;
+
+  const isResumption = !!loop.state.mentor.sessionId && loop.state.iteration > 0;
+  if (!isResumption) loop.state = { ...loop.state, turn: 'mentor' };
 
   try {
     let latestPlan: string;
-    const spec = getTaskSpec(state);
+    const spec = getTaskSpec(loop.state);
 
     if (!isResumption) {
-      state = prepareRun(state, 'mentor');
-      update(state);
-      if (checkStop()) return state;
+      loop.state = prepareRun(loop.state, 'mentor');
+      update(loop.state);
+      if (checkStop()) return loop.state;
 
       onLog('mentor', 'Planning…');
-      const mentorResult = await runTurn(state.directory, 'mentor', state.mentor, HANDOFF_PROMPTS.initialMentor(spec), turnCallbacks('mentor'));
+      const mentorResult = await runTurn(loop.state.directory, 'mentor', loop.state.mentor, HANDOFF_PROMPTS.initialMentor(spec), turnCallbacks('mentor'));
 
-      if (mentorResult.sessionId) state = { ...state, mentor: { ...state.mentor, sessionId: mentorResult.sessionId, tokenUsage: mentorResult.tokenUsage } };
-      state = addMessage(state, { from: 'mentor', to: 'executor', type: 'plan', content: mentorResult.output });
-      state = updateActivity(state, 'mentor', 'idle', 'Planning complete');
-      update(state);
-      onMessage(state);
+      if (mentorResult.sessionId) loop.state = { ...loop.state, mentor: { ...loop.state.mentor, sessionId: mentorResult.sessionId, tokenUsage: mentorResult.tokenUsage } };
+      loop.state = addMessage(loop.state, { from: 'mentor', to: 'executor', type: 'plan', content: mentorResult.output });
+      loop.state = updateActivity(loop.state, 'mentor', 'idle', 'Planning complete');
+      update(loop.state);
+      onMessage(loop.state);
       latestPlan = mentorResult.output;
     } else {
-      const lastMentorMsg = [...state.messages].reverse().find(m => m.from === 'mentor');
+      const lastMentorMsg = [...loop.state.messages].reverse().find(m => m.from === 'mentor');
       latestPlan = lastMentorMsg?.content ?? `Continue the task: ${spec}`;
       onLog('mentor', 'Resuming…');
     }
 
-    while (state.status !== 'finished' && state.status !== 'error' && state.status !== 'paused') {
+    while (loop.state.status !== 'finished' && loop.state.status !== 'error' && loop.state.status !== 'paused') {
       if (checkStop()) break;
 
-      state = prepareRun(state, 'executor');
-      update(state);
+      loop.state = prepareRun(loop.state, 'executor');
+      update(loop.state);
 
-      const history = getConversationHistory(state);
+      const history = getConversationHistory(loop.state);
       onLog('executor', 'Executing…');
-      const executorResult = await runTurn(state.directory, 'executor', state.executor, HANDOFF_PROMPTS.mentorToExecutor(latestPlan, spec), turnCallbacks('executor'));
+      const executorResult = await runTurn(loop.state.directory, 'executor', loop.state.executor, HANDOFF_PROMPTS.mentorToExecutor(latestPlan, spec), turnCallbacks('executor'));
 
-      if (executorResult.sessionId) state = { ...state, executor: { ...state.executor, sessionId: executorResult.sessionId, tokenUsage: executorResult.tokenUsage } };
-      state = addMessage(state, { from: 'executor', to: 'mentor', type: 'result', content: executorResult.output });
-      state = updateActivity(state, 'executor', 'idle', 'Execution complete');
-      update(state);
-      onMessage(state);
+      if (executorResult.sessionId) loop.state = { ...loop.state, executor: { ...loop.state.executor, sessionId: executorResult.sessionId, tokenUsage: executorResult.tokenUsage } };
+      loop.state = addMessage(loop.state, { from: 'executor', to: 'mentor', type: 'result', content: executorResult.output });
+      loop.state = updateActivity(loop.state, 'executor', 'idle', 'Execution complete');
+      update(loop.state);
+      onMessage(loop.state);
 
-      const changes = await getGitChanges(state.directory);
-      if (changes.length > 0) { state = { ...state, modifiedFiles: changes }; update(state); }
+      const changes = await getGitChanges(loop.state.directory);
+      if (changes.length > 0) { loop.state = { ...loop.state, modifiedFiles: changes }; update(loop.state); }
 
       // Only fires when a finite cap was set explicitly; the default is
       // Infinity (unlimited), so the loop runs until the mentor finishes.
-      if (Number.isFinite(state.maxIterations) && state.iteration >= state.maxIterations) {
-        state = setPairStatus(state, 'paused', `Max iterations reached (${state.maxIterations})`);
-        update(state);
+      if (Number.isFinite(loop.state.maxIterations) && loop.state.iteration >= loop.state.maxIterations) {
+        loop.state = setPairStatus(loop.state, 'paused', `Max iterations reached (${loop.state.maxIterations})`);
+        update(loop.state);
         break;
       }
 
       if (checkStop()) break;
 
-      state = prepareRun(state, 'mentor');
-      update(state);
+      loop.state = prepareRun(loop.state, 'mentor');
+      update(loop.state);
 
       onLog('mentor', 'Reviewing…');
-      const reviewResult = await runTurn(state.directory, 'mentor', state.mentor, HANDOFF_PROMPTS.executorToMentor(executorResult.output, spec, history), turnCallbacks('mentor'));
+      const reviewResult = await runTurn(loop.state.directory, 'mentor', loop.state.mentor, HANDOFF_PROMPTS.executorToMentor(executorResult.output, spec, history), turnCallbacks('mentor'));
 
-      if (reviewResult.sessionId) state = { ...state, mentor: { ...state.mentor, sessionId: reviewResult.sessionId, tokenUsage: reviewResult.tokenUsage } };
+      if (reviewResult.sessionId) loop.state = { ...loop.state, mentor: { ...loop.state.mentor, sessionId: reviewResult.sessionId, tokenUsage: reviewResult.tokenUsage } };
 
       const mentorWantsFinish = hasFinishSignal(reviewResult.output);
-      state = addMessage(state, { from: 'mentor', to: 'executor', type: 'acceptance', content: reviewResult.output });
-      state = updateActivity(state, 'mentor', 'idle', 'Review complete');
-      update(state);
-      onMessage(state);
+      loop.state = addMessage(loop.state, { from: 'mentor', to: 'executor', type: 'acceptance', content: reviewResult.output });
+      loop.state = updateActivity(loop.state, 'mentor', 'idle', 'Review complete');
+      update(loop.state);
+      onMessage(loop.state);
 
       if (mentorWantsFinish) {
-        state = setPairStatus(state, 'finished', 'Mentor signaled task complete');
-        update(state);
+        loop.state = setPairStatus(loop.state, 'finished', 'Mentor signaled task complete');
+        update(loop.state);
         break;
       }
 
       latestPlan = reviewResult.output;
 
-      if (state.status !== 'finished' && state.status !== 'paused' && state.status !== 'error') {
-        state = addMessage(state, { from: 'mentor', to: 'executor', type: 'handoff', content: 'Passing back to executor with feedback' });
-        update(state);
+      if (loop.state.status !== 'finished' && loop.state.status !== 'paused' && loop.state.status !== 'error') {
+        loop.state = addMessage(loop.state, { from: 'mentor', to: 'executor', type: 'handoff', content: 'Passing back to executor with feedback' });
+        update(loop.state);
       }
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (shouldStop()) {
-      state = setPairStatus(state, 'paused', 'Stopped by user during turn');
+    if (callbacks.shouldStop()) {
+      loop.state = setPairStatus(loop.state, 'paused', 'Stopped by user during turn');
     } else {
       onError(msg);
-      state = setPairStatus(state, 'error', msg);
+      loop.state = setPairStatus(loop.state, 'error', msg);
     }
-    update(state);
+    update(loop.state);
   }
 
-  return state;
+  return loop.state;
 }
 
 // ── Greeting smoke-test loop ─────────────────────────────────────────────
@@ -378,98 +403,74 @@ export async function runGreetingSession(
   initialState: PairState,
   callbacks: EngineCallbacks,
 ): Promise<PairState> {
-  let state = initialState;
-  const { onStateUpdate, onLog, onActivity, onTextDelta, onToolStart, onToolEnd, onMessage, onError, shouldStop } = callbacks;
+  const loop = createEngineLoop(initialState, callbacks);
+  const { update, turnCallbacks, checkStop } = loop;
+  const { onLog, onMessage, onError } = callbacks;
 
-  const update = (s: PairState) => { state = s; onStateUpdate(s); };
-
-  const turnCallbacks = (role: 'mentor' | 'executor'): TurnCallbacks => ({
-    onTextDelta: (t) => onTextDelta(role, t),
-    onToolStart: (ev) => onToolStart(role, ev),
-    onToolEnd: (id, status) => onToolEnd(role, id, status),
-    onSessionId: (id) => {
-      state = role === 'mentor'
-        ? { ...state, mentor: { ...state.mentor, sessionId: id } }
-        : { ...state, executor: { ...state.executor, sessionId: id } };
-    },
-    onActivity: (phase, label) => { state = updateActivity(state, role, phase, label); onActivity(role, phase, label); update(state); },
-    onLog: (line) => onLog(role, line),
-  });
-
-  const checkStop = (): boolean => {
-    if (shouldStop()) {
-      killActiveTurn();
-      state = setPairStatus(state, 'paused', 'Stopped by user');
-      update(state);
-      return true;
-    }
-    return false;
-  };
-
-  if (!state.greetingState) state = { ...state, greetingState: initializeGreetingState() };
+  if (!loop.state.greetingState) loop.state = { ...loop.state, greetingState: initializeGreetingState() };
 
   try {
     // Turn 1 — mentor greets.
-    state = { ...prepareRun(state, 'mentor'), status: 'greeting' };
-    update(state);
-    if (checkStop()) return state;
+    loop.state = { ...prepareRun(loop.state, 'mentor'), status: 'greeting' };
+    update(loop.state);
+    if (checkStop()) return loop.state;
 
     onLog('mentor', 'Saying hello…');
-    const mentorHello = await runTurn(state.directory, 'mentor', state.mentor, GREETING_PROMPTS.mentorHello(), turnCallbacks('mentor'));
-    if (mentorHello.sessionId) state = { ...state, mentor: { ...state.mentor, sessionId: mentorHello.sessionId, tokenUsage: mentorHello.tokenUsage } };
-    state = addGreetingMessage(state, 'mentor', mentorHello.output);
-    state = addMessage(state, { from: 'mentor', to: 'executor', type: 'greeting', content: mentorHello.output });
-    state = updateActivity(state, 'mentor', 'idle', 'Greeting sent');
-    update(state);
-    onMessage(state);
+    const mentorHello = await runTurn(loop.state.directory, 'mentor', loop.state.mentor, GREETING_PROMPTS.mentorHello(), turnCallbacks('mentor'));
+    if (mentorHello.sessionId) loop.state = { ...loop.state, mentor: { ...loop.state.mentor, sessionId: mentorHello.sessionId, tokenUsage: mentorHello.tokenUsage } };
+    loop.state = addGreetingMessage(loop.state, 'mentor', mentorHello.output);
+    loop.state = addMessage(loop.state, { from: 'mentor', to: 'executor', type: 'greeting', content: mentorHello.output });
+    loop.state = updateActivity(loop.state, 'mentor', 'idle', 'Greeting sent');
+    update(loop.state);
+    onMessage(loop.state);
 
-    if (checkStop()) return state;
+    if (checkStop()) return loop.state;
 
     // Turn 2 — executor greets back.
-    state = { ...prepareRun(state, 'executor'), status: 'greeting' };
-    update(state);
-    if (checkStop()) return state;
+    loop.state = { ...prepareRun(loop.state, 'executor'), status: 'greeting' };
+    update(loop.state);
+    if (checkStop()) return loop.state;
 
     onLog('executor', 'Greeting back…');
-    const executorHello = await runTurn(state.directory, 'executor', state.executor, GREETING_PROMPTS.executorHello(mentorHello.output), turnCallbacks('executor'));
-    if (executorHello.sessionId) state = { ...state, executor: { ...state.executor, sessionId: executorHello.sessionId, tokenUsage: executorHello.tokenUsage } };
-    state = addGreetingMessage(state, 'executor', executorHello.output);
-    state = addMessage(state, { from: 'executor', to: 'mentor', type: 'greeting', content: executorHello.output });
-    state = updateActivity(state, 'executor', 'idle', 'Ready');
-    update(state);
-    onMessage(state);
+    const executorHello = await runTurn(loop.state.directory, 'executor', loop.state.executor, GREETING_PROMPTS.executorHello(mentorHello.output), turnCallbacks('executor'));
+    if (executorHello.sessionId) loop.state = { ...loop.state, executor: { ...loop.state.executor, sessionId: executorHello.sessionId, tokenUsage: executorHello.tokenUsage } };
+    loop.state = addGreetingMessage(loop.state, 'executor', executorHello.output);
+    loop.state = addMessage(loop.state, { from: 'executor', to: 'mentor', type: 'greeting', content: executorHello.output });
+    loop.state = updateActivity(loop.state, 'executor', 'idle', 'Ready');
+    update(loop.state);
+    onMessage(loop.state);
 
-    if (checkStop()) return state;
+    if (checkStop()) return loop.state;
 
     // Turn 3 — mentor acknowledges and finishes (owns TASK_COMPLETE).
-    state = { ...prepareRun(state, 'mentor'), status: 'greeting' };
-    update(state);
-    if (checkStop()) return state;
+    loop.state = { ...prepareRun(loop.state, 'mentor'), status: 'greeting' };
+    update(loop.state);
+    if (checkStop()) return loop.state;
 
     onLog('mentor', 'Acknowledging…');
-    const mentorAck = await runTurn(state.directory, 'mentor', state.mentor, GREETING_PROMPTS.mentorFinish(executorHello.output), turnCallbacks('mentor'));
-    if (mentorAck.sessionId) state = { ...state, mentor: { ...state.mentor, sessionId: mentorAck.sessionId, tokenUsage: mentorAck.tokenUsage } };
-    state = addMessage(state, { from: 'mentor', to: 'executor', type: 'greeting', content: mentorAck.output });
-    state = updateActivity(state, 'mentor', 'idle', 'Acknowledged');
-    update(state);
-    onMessage(state);
+    const mentorAck = await runTurn(loop.state.directory, 'mentor', loop.state.mentor, GREETING_PROMPTS.mentorFinish(executorHello.output), turnCallbacks('mentor'));
+    if (mentorAck.sessionId) loop.state = { ...loop.state, mentor: { ...loop.state.mentor, sessionId: mentorAck.sessionId, tokenUsage: mentorAck.tokenUsage } };
+    loop.state = addMessage(loop.state, { from: 'mentor', to: 'executor', type: 'greeting', content: mentorAck.output });
+    loop.state = updateActivity(loop.state, 'mentor', 'idle', 'Acknowledged');
+    update(loop.state);
+    onMessage(loop.state);
 
     // The greeting session finishes on its own terms — finish whether or not the
     // model emitted the token, so it can never hang to maxIterations.
-    if (hasFinishSignal(mentorAck.output) || isGreetingComplete(state)) {
-      state = setPairStatus(state, 'finished', 'Greeting complete');
-      update(state);
+    if (hasFinishSignal(mentorAck.output) || isGreetingComplete(loop.state)) {
+      loop.state = setPairStatus(loop.state, 'finished', 'Greeting complete');
+      update(loop.state);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (shouldStop()) {
-      state = setPairStatus(state, 'paused', 'Stopped by user during turn');
+    if (callbacks.shouldStop()) {
+      loop.state = setPairStatus(loop.state, 'paused', 'Stopped by user during turn');
     } else {
       onError(msg);
-      state = setPairStatus(state, 'error', msg);
+      loop.state = setPairStatus(loop.state, 'error', msg);
     }
-    update(state);
+    update(loop.state);
   }
 
-  return state;
+  return loop.state;
 }

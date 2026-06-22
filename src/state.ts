@@ -61,10 +61,7 @@ export function addMessage(state: PairState, msg: Omit<Message, 'id' | 'timestam
     iteration: state.iteration,
   };
 
-  const messages = [...state.messages];
-  if (msg.type === 'plan' || msg.type === 'result' || msg.type === 'acceptance' || msg.type === 'handoff' || msg.type === 'feedback' || msg.type === 'greeting') {
-    messages.push(message);
-  }
+  const messages = [...state.messages, message];
 
   let turn = state.turn;
   // Handoff is a marker for the UI — the iteration counter is bumped by
@@ -163,8 +160,13 @@ export async function getGitChanges(directory: string): Promise<ModifiedFile[]> 
     const untracked = execSync('git ls-files --others --exclude-standard', { cwd: directory, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
 
     const files: ModifiedFile[] = tracked.trim().split('\n').filter(Boolean).map(line => {
-      const [status, path] = line.split('\t');
-      return { path, status: status as ModifiedFile['status'] };
+      const parts = line.split('\t');
+      // git diff --name-status emits e.g. "R100\told\tnew" for renames and
+      // "C75\tsrc\tdst" for copies. The status letter is the first char; the
+      // destination path is the last segment for renames/copies, otherwise [1].
+      const status = parts[0].charAt(0) as ModifiedFile['status'];
+      const path = parts.length > 2 ? parts[parts.length - 1] : parts[1];
+      return { path, status };
     });
 
     for (const path of untracked.trim().split('\n').filter(Boolean)) {

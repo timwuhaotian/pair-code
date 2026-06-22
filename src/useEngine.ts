@@ -39,7 +39,13 @@ export function useEngine(initial: PairState | null): EngineHook {
     shouldStop: () => stopRef.current,
   });
 
-  const runTask = useCallback(async (start: PairState): Promise<PairState> => {
+  // Shared run loop: reset streaming state, flush deltas on a timer, then
+  // delegate to the given engine function. runTask and runGreeting are thin
+  // wrappers so they stay in lockstep if the setup/teardown ever changes.
+  const runWith = useCallback(async (
+    start: PairState,
+    engine: (state: PairState, cbs: EngineCallbacks) => Promise<PairState>,
+  ): Promise<PairState> => {
     stopRef.current = false;
     setRunning(true);
     liveTextRef.current = '';
@@ -49,8 +55,7 @@ export function useEngine(initial: PairState | null): EngineHook {
     const flush = setInterval(() => setLiveText(liveTextRef.current), 60);
 
     try {
-      const final = await runPairEngine(start, makeCallbacks());
-      return final;
+      return await engine(start, makeCallbacks());
     } finally {
       clearInterval(flush);
       liveTextRef.current = '';
@@ -60,26 +65,15 @@ export function useEngine(initial: PairState | null): EngineHook {
     }
   }, []);
 
-  const runGreeting = useCallback(async (start: PairState): Promise<PairState> => {
-    stopRef.current = false;
-    setRunning(true);
-    liveTextRef.current = '';
-    setLiveText('');
-    setLiveTools([]);
+  const runTask = useCallback(
+    (start: PairState): Promise<PairState> => runWith(start, runPairEngine),
+    [runWith],
+  );
 
-    const flush = setInterval(() => setLiveText(liveTextRef.current), 60);
-
-    try {
-      const final = await runGreetingSession(start, makeCallbacks());
-      return final;
-    } finally {
-      clearInterval(flush);
-      liveTextRef.current = '';
-      setLiveText('');
-      setLiveTools([]);
-      setRunning(false);
-    }
-  }, []);
+  const runGreeting = useCallback(
+    (start: PairState): Promise<PairState> => runWith(start, runGreetingSession),
+    [runWith],
+  );
 
   const requestStop = useCallback(() => {
     stopRef.current = true;
