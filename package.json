@@ -1,7 +1,7 @@
 {
   "name": "pair-code",
-  "version": "0.1.0",
-  "description": "AI-powered pair coding harness — two agents collaborate on your code in the terminal",
+  "version": "0.2.0",
+  "description": "AI-powered pair coding harness — two agents collaborate on your code in the terminal, on the Claude Agent SDK",
   "type": "module",
   "license": "Apache-2.0",
   "keywords": [
@@ -19,7 +19,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/timwuhaotian/pair-code.git"
+    "url": "git+https://github.com/timwuhaotian/pair-cli.git"
+  },
+  "homepage": "https://github.com/timwuhaotian/pair-cli#readme",
+  "bugs": {
+    "url": "https://github.com/timwuhaotian/pair-cli/issues"
   },
   "bin": {
     "pair-code": "./dist/index.js",
@@ -40,16 +44,17 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "chalk": "^5.4.1",
-    "log-update": "^6.1.0",
-    "string-width": "^7.2.0",
-    "strip-ansi": "^7.1.0",
-    "wrap-ansi": "^9.0.0"
+    "@anthropic-ai/claude-agent-sdk": "^0.3.183",
+    "ink": "^7.1.0",
+    "react": "^19.2.7"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
+    "@types/react": "^19.2.17",
     "eslint": "^9.39.4",
+    "ink-testing-library": "^4.0.0",
     "tsup": "^8.4.0",
+    "tsx": "^4.22.4",
     "typescript": "^5.8.0",
     "typescript-eslint": "^8.59.4"
   }

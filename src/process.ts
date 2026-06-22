@@ -1,282 +1,234 @@
-import { spawn, type ChildProcess } from 'node:child_process';
-import { createInterface } from 'node:readline';
-import type { PairState } from './types.js';
-import { buildCommand } from './providers.js';
-import { addMessage, hasFinishSignal, setPairStatus, updateActivity, getConversationHistory, getGitChanges, prepareRun, getTaskSpec } from './state.js';
+import { query, type Query, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import type { PairState, AgentRuntime, ToolEvent, TokenUsage, ActivityPhase } from './types.js';
+import { resolveProfile, profileEnv } from './providers.js';
+import { addMessage, hasFinishSignal, setPairStatus, updateActivity, getConversationHistory, getGitChanges, prepareRun, getTaskSpec, initializeGreetingState, addGreetingMessage, isGreetingComplete } from './state.js';
 
-const EMPTY_OUTPUT = '(No textual output produced)';
 const TURN_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes per turn
+const EMPTY_OUTPUT = '(No textual output produced)';
 
-function truncateStderr(line: string): string {
-  const max = 80;
-  return line.length > max ? line.slice(0, max - 1) + '…' : line;
+// The mentor is statically read-only: it may inspect the repo to verify, but
+// can never mutate it. Everything not in this allowlist is also explicitly
+// disallowed so the model is never even offered a write/exec tool.
+const READ_ONLY_TOOLS = ['Read', 'Grep', 'Glob'];
+const NON_READ_TOOLS = ['Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Bash', 'BashOutput', 'KillShell', 'WebFetch', 'WebSearch', 'TodoWrite'];
+
+// ── Streaming primitives ────────────────────────────────────────────────
+
+export interface TurnCallbacks {
+  onTextDelta: (text: string) => void;
+  onToolStart: (ev: ToolEvent) => void;
+  onToolEnd: (id: string, status: 'done' | 'error') => void;
+  onSessionId: (id: string) => void;
+  onActivity: (phase: ActivityPhase, label: string) => void;
+  onLog: (line: string) => void;
 }
 
 export interface TurnResult {
   output: string;
   sessionId?: string;
-  tokenUsage?: { inputTokens?: number; outputTokens: number };
+  tokenUsage?: TokenUsage;
 }
 
-function parseJsonEvent(line: string): Record<string, any> | undefined {
-  try {
-    return JSON.parse(line);
-  } catch {
-    if (line.startsWith('data:')) {
-      try { return JSON.parse(line.slice(5).trim()); } catch { /* ignore */ }
-    }
-    return undefined;
+let activeQuery: Query | null = null;
+
+export function killActiveTurn(): void {
+  if (activeQuery) {
+    try { void activeQuery.interrupt(); } catch { /* ignore */ }
   }
 }
 
-function collectTexts(event: Record<string, any>, out: string[]): void {
-  for (const key of ['text', 'content', 'message', 'delta', 'part', 'parts', 'output_text', 'response', 'output']) {
-    const val = event[key];
-    if (typeof val === 'string' && val.trim()) {
-      if (out[out.length - 1] !== val.trim()) out.push(val.trim());
-    } else if (Array.isArray(val)) {
-      for (const item of val) {
-        if (typeof item === 'object' && item !== null) collectTexts(item, out);
-        else if (typeof item === 'string' && item.trim()) out.push(item.trim());
-      }
-    } else if (typeof val === 'object' && val !== null) {
-      collectTexts(val, out);
-    }
-  }
-}
+interface LooseBlock { type?: string; id?: string; name?: string; text?: string; input?: Record<string, unknown>; tool_use_id?: string; is_error?: boolean; content?: unknown }
+interface LooseStreamEvent { type?: string; delta?: { type?: string; text?: string }; content_block?: { type?: string } }
 
-function extractClaudeFinalOutput(event: Record<string, any>): string | undefined {
-  if (event.type === 'result' && typeof event.result === 'string') {
-    return event.result.trim() || undefined;
-  }
-  if (event.type === 'assistant' && Array.isArray(event.message?.content)) {
-    return event.message.content
-      .filter((b: any) => b.type === 'text')
-      .map((b: any) => b.text)
-      .join('\n')
-      .trim() || undefined;
+function toolTarget(input: Record<string, unknown> | undefined): string | undefined {
+  if (!input) return undefined;
+  for (const key of ['file_path', 'path', 'notebook_path', 'command', 'pattern', 'url', 'query']) {
+    const v = input[key];
+    if (typeof v === 'string' && v.trim()) return v.trim();
   }
   return undefined;
 }
 
-function collapse(candidates: string[]): string | undefined {
-  if (candidates.length === 0) return undefined;
-  if (candidates.every(c => c === candidates[0])) return candidates[0];
-  const joined = candidates.join('\n');
-  const longest = candidates.reduce((a, b) => a.length >= b.length ? a : b, '');
-  if (longest.length * 2 >= joined.length) return longest;
-  return joined;
-}
-
-let activeChild: ChildProcess | null = null;
-
-export function killActiveChild(): void {
-  if (activeChild && !activeChild.killed) {
-    try { activeChild.kill('SIGTERM'); } catch { /* ignore */ }
-  }
-}
-
-export function spawnTurn(
-  state: PairState,
+export async function runTurn(
+  directory: string,
   role: 'mentor' | 'executor',
+  runtime: AgentRuntime,
   message: string,
-  onLog: (line: string) => void,
-  onActivity: (phase: 'thinking' | 'using_tools' | 'responding' | 'idle', label: string) => void,
+  cbs: TurnCallbacks,
 ): Promise<TurnResult> {
-  return new Promise((resolve, reject) => {
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      if (child && !child.killed) child.kill('SIGTERM');
-      const stderrTail = stderrLines.slice(-3).join(' | ');
-      const hint = stderrTail
-        ? ` (last stderr: ${truncateStderr(stderrTail)})`
-        : ' — the CLI produced no output. Check authentication and network.';
-      reject(new Error(`${role} turn timed out after ${TURN_TIMEOUT_MS / 1000}s${hint}`));
-    }, TURN_TIMEOUT_MS);
+  const resolved = resolveProfile(runtime.profileName);
+  if (!resolved) {
+    throw new Error(`Profile "${runtime.profileName}" is not configured — set PAIR_PROFILE_${runtime.profileName.toUpperCase()}_KEY (and _BASE_URL) in your environment.`);
+  }
 
-    const provider = role === 'mentor' ? state.mentor : state.executor;
-    const cmd = buildCommand({
-      provider: provider.provider,
-      model: provider.model,
-      sessionId: provider.sessionId,
-      role,
-      message,
-      reasoningEffort: provider.reasoningEffort,
-    });
+  const isMentor = role === 'mentor';
+  const controller = new AbortController();
 
-    onLog(`spawning: ${cmd.executable} ${cmd.args.length} args`);
+  const options: Options = {
+    cwd: directory,
+    model: runtime.model,
+    env: profileEnv(resolved),
+    resume: runtime.sessionId,
+    includePartialMessages: true,
+    permissionMode: 'bypassPermissions',
+    abortController: controller,
+    allowedTools: isMentor ? READ_ONLY_TOOLS : undefined,
+    disallowedTools: isMentor ? NON_READ_TOOLS : undefined,
+    systemPrompt: {
+      type: 'preset',
+      preset: 'claude_code',
+      append: isMentor ? MENTOR_APPEND : EXECUTOR_APPEND,
+    },
+    stderr: (data: string) => {
+      const line = data.trim();
+      if (!line) return;
+      cbs.onLog(`[stderr] ${line}`);
+      const lower = line.toLowerCase();
+      if (/(rate ?limit|exhausted|429|throttl|overload)/.test(lower)) cbs.onActivity('thinking', 'Throttled — retrying');
+      else if (/(auth|unauthor|invalid api key|credential)/.test(lower)) cbs.onActivity('thinking', 'Auth issue');
+    },
+  };
 
-    // `stdio[0] = 'ignore'` is CRITICAL. OpenCode, Codex, and Gemini all read
-    // stdin until EOF when invoked with a prompt argument; leaving stdin as an
-    // open pipe makes them block indefinitely (this caused the executor turn
-    // to time out after 10 minutes).
-    const child = spawn(cmd.executable, cmd.args, {
-      cwd: state.directory,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env },
-    });
-    activeChild = child;
+  let streamedText = '';
+  let finalText = '';
+  let sessionId: string | undefined = runtime.sessionId;
+  let tokenUsage: TokenUsage | undefined;
+  let firstToken = true;
 
-    let accumulated = '';
-    const jsonCandidates: string[] = [];
-    let firstOutput = true;
-    let sessionId: string | undefined;
-    let tokenUsage: { inputTokens?: number; outputTokens: number } | undefined;
-    let cliErrorMessage: string | undefined;
-    const stderrLines: string[] = [];
-    const claudeFinalCandidates: string[] = [];
-    const isClaude = provider.provider === 'claude';
+  const timer = setTimeout(() => {
+    controller.abort();
+    killActiveTurn();
+  }, TURN_TIMEOUT_MS);
 
-    const extractErrorMessage = (event: Record<string, any>): string | undefined => {
-      const err = event.error;
-      if (typeof err === 'string') return err;
-      if (err && typeof err === 'object') {
-        return err.data?.message ?? err.message ?? err.error?.message ?? JSON.stringify(err);
+  const q = query({ prompt: message, options });
+  activeQuery = q;
+
+  try {
+    for await (const msg of q as AsyncIterable<SDKMessage>) {
+      if (msg.type === 'system' && msg.subtype === 'init') {
+        sessionId = msg.session_id;
+        cbs.onSessionId(sessionId);
+        cbs.onActivity('thinking', 'Analyzing');
+        continue;
       }
-      if (typeof event.message === 'string' && event.is_error) return event.message;
-      return undefined;
-    };
 
-    const stdout = createInterface({ input: child.stdout! });
-    const stderr = createInterface({ input: child.stderr! });
-
-    stderr.on('line', (line: string) => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
-      stderrLines.push(trimmed);
-      if (stderrLines.length > 20) stderrLines.shift();
-      onLog(`[stderr] ${trimmed}`);
-      // Surface known retry/throttle/auth signals as activity so the user
-      // sees why a turn is taking a long time instead of guessing.
-      const lower = trimmed.toLowerCase();
-      if (/(rate ?limit|exhausted|retry|429|throttl)/.test(lower)) {
-        onActivity('thinking', `Throttled: ${truncateStderr(trimmed)}`);
-      } else if (/(auth|unauthor|sign in|login|credential|api key)/.test(lower)) {
-        onActivity('thinking', `Auth issue: ${truncateStderr(trimmed)}`);
-      }
-    });
-
-    stdout.on('line', (line: string) => {
-      const event = parseJsonEvent(line);
-      if (event) {
-        const sid = event.sessionID ?? event.session_id ?? event.part?.sessionID ?? event.part?.session_id;
-        if (sid) sessionId = sid;
-
-        // Detect error events from any provider's JSON stream so we surface
-        // the real message instead of "(No textual output produced)".
-        const eventTypeLower = (event.type ?? '').toString().toLowerCase();
-        if (eventTypeLower === 'error' || event.error || event.is_error) {
-          const msg = extractErrorMessage(event);
-          if (msg && !cliErrorMessage) cliErrorMessage = msg;
+      if (msg.type === 'stream_event') {
+        const ev = msg.event as unknown as LooseStreamEvent;
+        if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta' && ev.delta.text) {
+          if (firstToken) { cbs.onActivity('responding', 'Writing'); firstToken = false; }
+          streamedText += ev.delta.text;
+          cbs.onTextDelta(ev.delta.text);
         }
+        continue;
+      }
 
-        const usage = event.usage ?? event.usageMetadata;
-        if (usage) {
-          const out = usage.output_tokens ?? usage.completion_tokens ?? usage.completionTokens ?? usage.candidatesTokenCount ?? usage.output;
-          const inp = usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokens ?? usage.promptTokenCount ?? usage.input;
-          if (typeof out === 'number') {
-            tokenUsage = { outputTokens: out, inputTokens: typeof inp === 'number' ? inp : undefined };
+      if (msg.type === 'assistant') {
+        const blocks = (msg.message.content as unknown as LooseBlock[]) ?? [];
+        for (const b of blocks) {
+          if (b.type === 'tool_use' && b.id) {
+            cbs.onActivity('using_tools', `${b.name ?? 'tool'}`);
+            cbs.onToolStart({ id: b.id, name: b.name ?? 'tool', target: toolTarget(b.input), status: 'running' });
           }
         }
+        continue;
+      }
 
-        if (isClaude) {
-          const final = extractClaudeFinalOutput(event);
-          if (final) claudeFinalCandidates.push(final);
+      if (msg.type === 'user') {
+        const blocks = (msg.message.content as unknown as LooseBlock[]) ?? [];
+        for (const b of blocks) {
+          if (b.type === 'tool_result' && b.tool_use_id) {
+            cbs.onToolEnd(b.tool_use_id, b.is_error ? 'error' : 'done');
+          }
+        }
+        continue;
+      }
+
+      if (msg.type === 'result') {
+        sessionId = msg.session_id;
+        const u = msg.usage as unknown as { output_tokens?: number; input_tokens?: number } | undefined;
+        tokenUsage = {
+          outputTokens: u?.output_tokens ?? 0,
+          inputTokens: u?.input_tokens,
+          costUsd: msg.total_cost_usd,
+        };
+        if (msg.subtype === 'success') {
+          finalText = msg.result;
         } else {
-          collectTexts(event, jsonCandidates);
+          const detail = (msg.errors && msg.errors.length) ? msg.errors.join('; ') : msg.subtype;
+          throw new Error(`${role} agent ended with ${msg.subtype}: ${detail}`);
         }
-
-        const eventType = (event.type ?? '').toLowerCase();
-        const toolName = event.name ?? event.tool_name ?? event.tool;
-        if (firstOutput) {
-          if (eventType.includes('tool') || eventType.includes('function_call')) {
-            onActivity('using_tools', `Calling ${toolName ?? 'tool'}`);
-          } else if (eventType.includes('content') || eventType.includes('stream') || eventType.includes('message') || eventType.includes('text')) {
-            onActivity('responding', 'Streaming response');
-          } else {
-            onActivity('thinking', 'Analyzing task');
-          }
-          firstOutput = false;
-        } else if (eventType.includes('tool') || eventType.includes('function_call')) {
-          onActivity('using_tools', `Calling ${toolName ?? 'tool'}`);
-        } else if (eventType.includes('text') || eventType.includes('content')) {
-          onActivity('responding', 'Streaming response');
-        }
-
-        onLog(`[json:${event.type ?? 'unknown'}]`);
-      } else {
-        const trimmed = line.trim();
-        if (trimmed && !trimmed.startsWith('{') && !trimmed.startsWith('data:')) {
-          accumulated += (accumulated ? '\n' : '') + trimmed;
-          if (firstOutput) {
-            onActivity('responding', 'Streaming response');
-            firstOutput = false;
-          }
-        }
-        onLog(trimmed || line);
       }
-    });
+    }
+  } finally {
+    clearTimeout(timer);
+    if (activeQuery === q) activeQuery = null;
+  }
 
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      if (activeChild === child) activeChild = null;
-      if (timedOut) return;
-      onLog(`process exited code=${code} signal=${signal}`);
+  if (controller.signal.aborted && !finalText) {
+    throw new Error(`${role} turn aborted`);
+  }
 
-      if (signal === 'SIGTERM' || signal === 'SIGKILL' || signal === 'SIGINT') {
-        reject(new Error(`${role} CLI was terminated (${signal})`));
-        return;
-      }
-
-      if (cliErrorMessage) {
-        reject(new Error(`${provider.provider} (${role}) → ${cliErrorMessage}`));
-        return;
-      }
-
-      const finalOutput =
-        claudeFinalCandidates.length > 0
-          ? collapse(claudeFinalCandidates) ?? EMPTY_OUTPUT
-          : collapse(jsonCandidates) ?? (accumulated.trim() || EMPTY_OUTPUT);
-
-      if (code !== 0 && code !== null && finalOutput === EMPTY_OUTPUT) {
-        const stderrTail = stderrLines.slice(-4).join(' | ');
-        const detail = stderrTail ? ` — ${stderrTail}` : '';
-        reject(new Error(`${role} CLI (${provider.provider}) exited with code ${code} and no output${detail}`));
-        return;
-      }
-
-      resolve({
-        output: finalOutput,
-        sessionId,
-        tokenUsage,
-      });
-    });
-
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      if (activeChild === child) activeChild = null;
-      if (timedOut) return;
-      reject(err);
-    });
-  });
+  return {
+    output: finalText.trim() || streamedText.trim() || EMPTY_OUTPUT,
+    sessionId,
+    tokenUsage,
+  };
 }
+
+// ── Handoff prompts ─────────────────────────────────────────────────────
+
+const MENTOR_APPEND =
+  'You are the MENTOR in a pair-programming loop: you PLAN and REVIEW, you never write code. ' +
+  'You are running in READ-ONLY mode — you may use Read, Grep and Glob to inspect the repository and verify claims, but you have no write or shell tools. ' +
+  'Be precise and demanding about correctness.';
+
+const EXECUTOR_APPEND =
+  'You are the EXECUTOR in a pair-programming loop: you implement the mentor\'s plan with full tool access. ' +
+  'After making changes, verify them yourself (build / typecheck / tests as appropriate) and include the relevant command output as evidence in your hand-off, because the mentor reviews statically and cannot run commands. ' +
+  'Never emit the token TASK_COMPLETE — only the mentor may end the session.';
 
 const HANDOFF_PROMPTS = {
+  initialMentor: (spec: string) =>
+    `## Task\n${spec}\n\nCreate a detailed, actionable plan for the executor. Include: analysis of the task, a step-by-step implementation plan, files to create/modify, and key risks. You may Read/Grep/Glob the repo first to ground the plan. Do NOT emit TASK_COMPLETE in this planning turn.`,
+
   mentorToExecutor: (plan: string, spec: string) =>
-    `You are the EXECUTOR agent in a pair programming session.\n\n## Task\n${spec}\n\n## Mentor's Plan\n${plan}\n\nExecute the plan above. Make all necessary code changes. When done, describe what you changed. Do NOT use the signal TASK_COMPLETE — only the Mentor can finish the session.`,
+    `## Task\n${spec}\n\n## Mentor's Plan\n${plan}\n\nExecute the plan. Make all necessary code changes, then verify them (build/typecheck/tests) and report what you changed plus the verification output. Do NOT emit TASK_COMPLETE — only the mentor can finish.`,
 
   executorToMentor: (executorResult: string, spec: string, history: string) =>
-    `You are the MENTOR agent in a pair programming session.\n\n## Task\n${spec}\n\n## Full Conversation History\n${history}\n\n## Executor's Latest Work\n${executorResult}\n\nReview the executor's work. Check for:\n1. Completeness — does it fulfill the task spec?\n2. Correctness — are there bugs or logic errors?\n3. Quality — is the code clean and well-structured?\n\nIf the work is satisfactory and complete, respond with TASK_COMPLETE on its own line.\nIf issues remain, explain what needs to be fixed and pass back to the executor.\n\nYou MUST include a structured review in this format:\n\`\`\`json\n{"verdict":"pass|fail","risk":"low|medium|high","confidence":0.0-1.0,"issues":[],"evidence":[],"reasoning":"...","summary":"...","nextStep":{"action":"continue|finish","instructions":[]}}\n\`\`\``,
-
-  initialMentor: (spec: string) =>
-    `You are the MENTOR agent in a pair programming session. Your job is to plan and review.\n\n## Task\n${spec}\n\nCreate a detailed plan for the executor to follow. Include:\n1. Analysis of the task\n2. Step-by-step implementation plan\n3. Files to modify/create\n4. Key considerations\n\nBe specific and actionable. The executor will follow your plan exactly. Do NOT use the signal TASK_COMPLETE in this planning turn.`,
+    `## Task\n${spec}\n\n## Conversation History\n${history}\n\n## Executor's Latest Work (with its own verification evidence)\n${executorResult}\n\nReview the work read-only. Use Read/Grep/Glob to independently confirm the changes and the evidence — do not trust the self-report blindly. Check completeness, correctness, and quality.\n\nIf it fully satisfies the task, respond with TASK_COMPLETE on its own line. Otherwise explain precisely what must be fixed and hand back.\n\nAlways include a structured review:\n\`\`\`json\n{"verdict":"pass|fail","risk":"low|medium|high","confidence":0.0-1.0,"issues":[],"evidence":[],"reasoning":"...","summary":"...","nextStep":{"action":"continue|finish","instructions":[]}}\n\`\`\``,
 };
+
+// ── Greeting smoke-test prompts ─────────────────────────────────────────
+// A lightweight 3-turn script that exercises the pair loop (streaming, profile
+// resolution, per-role tool asymmetry, session continuity, timeout) without a
+// coding task. The mentor owns the finishing TASK_COMPLETE, preserving the
+// invariant in CLAUDE.md; the executor is reminded of the prohibition on its
+// turn (EXECUTOR_APPEND already forbids it).
+const GREETING_PROMPTS = {
+  mentorHello: () =>
+    `This is a greeting smoke-test of the pair loop — there is no coding task. ` +
+    `Briefly say hello to the executor and ask it to confirm it is ready (one or two sentences). ` +
+    `Do NOT plan, review, or write code. Do NOT emit TASK_COMPLETE.`,
+
+  executorHello: (mentorHello: string) =>
+    `## Mentor's greeting\n${mentorHello}\n\nThis is a greeting smoke-test — no coding task. ` +
+    `Briefly say hello back and confirm you are ready (one or two sentences). Do NOT write code. ` +
+    `Do NOT emit TASK_COMPLETE — only the mentor can finish.`,
+
+  mentorFinish: (executorHello: string) =>
+    `## Executor's greeting\n${executorHello}\n\nThe greeting exchange is complete. ` +
+    `Acknowledge in one sentence, then end the session by emitting TASK_COMPLETE on its own line.`,
+};
+
+// ── Engine loop ─────────────────────────────────────────────────────────
 
 export interface EngineCallbacks {
   onStateUpdate: (state: PairState) => void;
   onLog: (role: string, line: string) => void;
-  onActivity: (role: string, phase: 'thinking' | 'using_tools' | 'responding' | 'idle', label: string) => void;
+  onActivity: (role: string, phase: ActivityPhase, label: string) => void;
+  onTextDelta: (role: string, text: string) => void;
+  onToolStart: (role: string, ev: ToolEvent) => void;
+  onToolEnd: (role: string, id: string, status: 'done' | 'error') => void;
   onMessage: (state: PairState) => void;
   onError: (error: string) => void;
   shouldStop: () => boolean;
@@ -287,16 +239,26 @@ export async function runPairEngine(
   callbacks: EngineCallbacks,
 ): Promise<PairState> {
   let state = initialState;
-  const { onStateUpdate, onLog, onActivity, onMessage, onError, shouldStop } = callbacks;
+  const { onStateUpdate, onLog, onActivity, onTextDelta, onToolStart, onToolEnd, onMessage, onError, shouldStop } = callbacks;
 
-  const update = (s: PairState) => {
-    state = s;
-    onStateUpdate(s);
-  };
+  const update = (s: PairState) => { state = s; onStateUpdate(s); };
+
+  const turnCallbacks = (role: 'mentor' | 'executor'): TurnCallbacks => ({
+    onTextDelta: (t) => onTextDelta(role, t),
+    onToolStart: (ev) => onToolStart(role, ev),
+    onToolEnd: (id, status) => onToolEnd(role, id, status),
+    onSessionId: (id) => {
+      state = role === 'mentor'
+        ? { ...state, mentor: { ...state.mentor, sessionId: id } }
+        : { ...state, executor: { ...state.executor, sessionId: id } };
+    },
+    onActivity: (phase, label) => { state = updateActivity(state, role, phase, label); onActivity(role, phase, label); update(state); },
+    onLog: (line) => onLog(role, line),
+  });
 
   const checkStop = (): boolean => {
     if (shouldStop()) {
-      killActiveChild();
+      killActiveTurn();
       state = setPairStatus(state, 'paused', 'Stopped by user');
       update(state);
       return true;
@@ -304,8 +266,6 @@ export async function runPairEngine(
     return false;
   };
 
-  // Resume vs. fresh start: if the state already has a mentor session id, treat
-  // this run as a resumption and skip the initial planning turn.
   const isResumption = !!state.mentor.sessionId && state.iteration > 0;
   if (!isResumption) state = { ...state, turn: 'mentor' };
 
@@ -316,33 +276,21 @@ export async function runPairEngine(
     if (!isResumption) {
       state = prepareRun(state, 'mentor');
       update(state);
-
       if (checkStop()) return state;
 
-      const mentorPrompt = HANDOFF_PROMPTS.initialMentor(spec);
-      onLog('mentor', 'Starting planning turn...');
+      onLog('mentor', 'Planning…');
+      const mentorResult = await runTurn(state.directory, 'mentor', state.mentor, HANDOFF_PROMPTS.initialMentor(spec), turnCallbacks('mentor'));
 
-      const mentorResult = await spawnTurn(
-        state, 'mentor', mentorPrompt,
-        (line) => onLog('mentor', line),
-        (phase, label) => onActivity('mentor', phase, label),
-      );
-
-      if (mentorResult.sessionId) {
-        state = { ...state, mentor: { ...state.mentor, sessionId: mentorResult.sessionId } };
-      }
-
+      if (mentorResult.sessionId) state = { ...state, mentor: { ...state.mentor, sessionId: mentorResult.sessionId, tokenUsage: mentorResult.tokenUsage } };
       state = addMessage(state, { from: 'mentor', to: 'executor', type: 'plan', content: mentorResult.output });
       state = updateActivity(state, 'mentor', 'idle', 'Planning complete');
       update(state);
       onMessage(state);
-
       latestPlan = mentorResult.output;
     } else {
-      // Find the latest mentor message to use as the plan.
       const lastMentorMsg = [...state.messages].reverse().find(m => m.from === 'mentor');
       latestPlan = lastMentorMsg?.content ?? `Continue the task: ${spec}`;
-      onLog('mentor', 'Resuming session...');
+      onLog('mentor', 'Resuming…');
     }
 
     while (state.status !== 'finished' && state.status !== 'error' && state.status !== 'paused') {
@@ -352,31 +300,21 @@ export async function runPairEngine(
       update(state);
 
       const history = getConversationHistory(state);
-      const executorPrompt = HANDOFF_PROMPTS.mentorToExecutor(latestPlan, spec);
-      onLog('executor', 'Starting execution turn...');
+      onLog('executor', 'Executing…');
+      const executorResult = await runTurn(state.directory, 'executor', state.executor, HANDOFF_PROMPTS.mentorToExecutor(latestPlan, spec), turnCallbacks('executor'));
 
-      const executorResult = await spawnTurn(
-        state, 'executor', executorPrompt,
-        (line) => onLog('executor', line),
-        (phase, label) => onActivity('executor', phase, label),
-      );
-
-      if (executorResult.sessionId) {
-        state = { ...state, executor: { ...state.executor, sessionId: executorResult.sessionId } };
-      }
-
+      if (executorResult.sessionId) state = { ...state, executor: { ...state.executor, sessionId: executorResult.sessionId, tokenUsage: executorResult.tokenUsage } };
       state = addMessage(state, { from: 'executor', to: 'mentor', type: 'result', content: executorResult.output });
       state = updateActivity(state, 'executor', 'idle', 'Execution complete');
       update(state);
       onMessage(state);
 
       const changes = await getGitChanges(state.directory);
-      if (changes.length > 0) {
-        state = { ...state, modifiedFiles: changes };
-        update(state);
-      }
+      if (changes.length > 0) { state = { ...state, modifiedFiles: changes }; update(state); }
 
-      if (state.iteration >= state.maxIterations) {
+      // Only fires when a finite cap was set explicitly; the default is
+      // Infinity (unlimited), so the loop runs until the mentor finishes.
+      if (Number.isFinite(state.maxIterations) && state.iteration >= state.maxIterations) {
         state = setPairStatus(state, 'paused', `Max iterations reached (${state.maxIterations})`);
         update(state);
         break;
@@ -387,21 +325,12 @@ export async function runPairEngine(
       state = prepareRun(state, 'mentor');
       update(state);
 
-      const reviewPrompt = HANDOFF_PROMPTS.executorToMentor(executorResult.output, spec, history);
-      onLog('mentor', 'Starting review turn...');
+      onLog('mentor', 'Reviewing…');
+      const reviewResult = await runTurn(state.directory, 'mentor', state.mentor, HANDOFF_PROMPTS.executorToMentor(executorResult.output, spec, history), turnCallbacks('mentor'));
 
-      const reviewResult = await spawnTurn(
-        state, 'mentor', reviewPrompt,
-        (line) => onLog('mentor', line),
-        (phase, label) => onActivity('mentor', phase, label),
-      );
-
-      if (reviewResult.sessionId) {
-        state = { ...state, mentor: { ...state.mentor, sessionId: reviewResult.sessionId } };
-      }
+      if (reviewResult.sessionId) state = { ...state, mentor: { ...state.mentor, sessionId: reviewResult.sessionId, tokenUsage: reviewResult.tokenUsage } };
 
       const mentorWantsFinish = hasFinishSignal(reviewResult.output);
-
       state = addMessage(state, { from: 'mentor', to: 'executor', type: 'acceptance', content: reviewResult.output });
       state = updateActivity(state, 'mentor', 'idle', 'Review complete');
       update(state);
@@ -422,9 +351,117 @@ export async function runPairEngine(
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    // Differentiate a user-initiated stop (second Ctrl+C kills the child mid-turn,
-    // which causes spawnTurn to reject) from a real failure. shouldStop() is the
-    // single source of truth — if the user asked to stop, treat it as pause.
+    if (shouldStop()) {
+      state = setPairStatus(state, 'paused', 'Stopped by user during turn');
+    } else {
+      onError(msg);
+      state = setPairStatus(state, 'error', msg);
+    }
+    update(state);
+  }
+
+  return state;
+}
+
+// ── Greeting smoke-test loop ─────────────────────────────────────────────
+//
+// Unlike the open-ended task loop (which must NOT auto-finish — it waits for
+// the mentor's TASK_COMPLETE up to maxIterations), the greeting session owns
+// its own termination: once the mentor's ack turn runs and the exchange is
+// complete, it finishes unconditionally so it can never hang.
+//
+// Round flow (matches GreetingState.maxRounds = 2):
+//   1. mentor  — greet the executor            → greeting round 1
+//   2. executor — greet back, confirm ready     → greeting round 2 (complete)
+//   3. mentor  — ack, then emit TASK_COMPLETE   → status 'finished'
+export async function runGreetingSession(
+  initialState: PairState,
+  callbacks: EngineCallbacks,
+): Promise<PairState> {
+  let state = initialState;
+  const { onStateUpdate, onLog, onActivity, onTextDelta, onToolStart, onToolEnd, onMessage, onError, shouldStop } = callbacks;
+
+  const update = (s: PairState) => { state = s; onStateUpdate(s); };
+
+  const turnCallbacks = (role: 'mentor' | 'executor'): TurnCallbacks => ({
+    onTextDelta: (t) => onTextDelta(role, t),
+    onToolStart: (ev) => onToolStart(role, ev),
+    onToolEnd: (id, status) => onToolEnd(role, id, status),
+    onSessionId: (id) => {
+      state = role === 'mentor'
+        ? { ...state, mentor: { ...state.mentor, sessionId: id } }
+        : { ...state, executor: { ...state.executor, sessionId: id } };
+    },
+    onActivity: (phase, label) => { state = updateActivity(state, role, phase, label); onActivity(role, phase, label); update(state); },
+    onLog: (line) => onLog(role, line),
+  });
+
+  const checkStop = (): boolean => {
+    if (shouldStop()) {
+      killActiveTurn();
+      state = setPairStatus(state, 'paused', 'Stopped by user');
+      update(state);
+      return true;
+    }
+    return false;
+  };
+
+  if (!state.greetingState) state = { ...state, greetingState: initializeGreetingState() };
+
+  try {
+    // Turn 1 — mentor greets.
+    state = { ...prepareRun(state, 'mentor'), status: 'greeting' };
+    update(state);
+    if (checkStop()) return state;
+
+    onLog('mentor', 'Saying hello…');
+    const mentorHello = await runTurn(state.directory, 'mentor', state.mentor, GREETING_PROMPTS.mentorHello(), turnCallbacks('mentor'));
+    if (mentorHello.sessionId) state = { ...state, mentor: { ...state.mentor, sessionId: mentorHello.sessionId, tokenUsage: mentorHello.tokenUsage } };
+    state = addGreetingMessage(state, 'mentor', mentorHello.output);
+    state = addMessage(state, { from: 'mentor', to: 'executor', type: 'greeting', content: mentorHello.output });
+    state = updateActivity(state, 'mentor', 'idle', 'Greeting sent');
+    update(state);
+    onMessage(state);
+
+    if (checkStop()) return state;
+
+    // Turn 2 — executor greets back.
+    state = { ...prepareRun(state, 'executor'), status: 'greeting' };
+    update(state);
+    if (checkStop()) return state;
+
+    onLog('executor', 'Greeting back…');
+    const executorHello = await runTurn(state.directory, 'executor', state.executor, GREETING_PROMPTS.executorHello(mentorHello.output), turnCallbacks('executor'));
+    if (executorHello.sessionId) state = { ...state, executor: { ...state.executor, sessionId: executorHello.sessionId, tokenUsage: executorHello.tokenUsage } };
+    state = addGreetingMessage(state, 'executor', executorHello.output);
+    state = addMessage(state, { from: 'executor', to: 'mentor', type: 'greeting', content: executorHello.output });
+    state = updateActivity(state, 'executor', 'idle', 'Ready');
+    update(state);
+    onMessage(state);
+
+    if (checkStop()) return state;
+
+    // Turn 3 — mentor acknowledges and finishes (owns TASK_COMPLETE).
+    state = { ...prepareRun(state, 'mentor'), status: 'greeting' };
+    update(state);
+    if (checkStop()) return state;
+
+    onLog('mentor', 'Acknowledging…');
+    const mentorAck = await runTurn(state.directory, 'mentor', state.mentor, GREETING_PROMPTS.mentorFinish(executorHello.output), turnCallbacks('mentor'));
+    if (mentorAck.sessionId) state = { ...state, mentor: { ...state.mentor, sessionId: mentorAck.sessionId, tokenUsage: mentorAck.tokenUsage } };
+    state = addMessage(state, { from: 'mentor', to: 'executor', type: 'greeting', content: mentorAck.output });
+    state = updateActivity(state, 'mentor', 'idle', 'Acknowledged');
+    update(state);
+    onMessage(state);
+
+    // The greeting session finishes on its own terms — finish whether or not the
+    // model emitted the token, so it can never hang to maxIterations.
+    if (hasFinishSignal(mentorAck.output) || isGreetingComplete(state)) {
+      state = setPairStatus(state, 'finished', 'Greeting complete');
+      update(state);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     if (shouldStop()) {
       state = setPairStatus(state, 'paused', 'Stopped by user during turn');
     } else {

@@ -1,4 +1,27 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
+*.tsbuildinfo
+
+# Packaging
 *.tgz
+
+# Secrets / local env (never commit API keys)
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# Coverage
+coverage/
+
+# OS / editor
 .DS_Store
+.idea/
+.vscode/
+*.swp

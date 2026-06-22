@@ -1,259 +1,254 @@
-import { exec } from 'node:child_process';
-import { promisify } from 'node:util';
-import type { ProviderKind, ProviderCommand } from './types.js';
+import type { Profile, ResolvedProfile } from './types.js';
+import { readConfig, writeConfig } from './config.js';
 
-interface ProviderInfo {
-  cli: string;
-  aliases: string[];
-  args: (opts: ProviderBuildOpts) => string[];
-  detectArgs: string[];
-  label: string;
+/**
+ * Profiles come from three sources, in precedence order:
+ *
+ *   1. Environment (never persisted by us):
+ *        PAIR_PROFILE_<NAME>_BASE_URL   Anthropic-compatible endpoint
+ *        PAIR_PROFILE_<NAME>_KEY        API key / bearer token            (required)
+ *        PAIR_PROFILE_<NAME>_MODEL      default model id                  (optional)
+ *      …plus the implicit official endpoint via the standard ANTHROPIC_API_KEY
+ *      (+ optional ANTHROPIC_BASE_URL).
+ *   2. Session profiles entered interactively — in-memory for the session only.
+ *   3. Saved profiles the user opted to "remember" — persisted to the on-disk
+ *      config (see config.ts). This is the only place a key touches disk.
+ *
+ * A profile is "ready" only when its key is present, so the picker can only ever
+ * offer endpoints that can actually run.
+ */
+
+const PROFILE_PREFIX = 'PAIR_PROFILE_';
+const PROFILE_SUFFIXES = ['_BASE_URL', '_KEY', '_MODEL'] as const;
+
+function envValue(name: string): string | undefined {
+  const v = process.env[name];
+  return v && v.trim() ? v.trim() : undefined;
 }
 
-interface ProviderBuildOpts {
-  model: string;
-  sessionId?: string;
-  role: 'mentor' | 'executor';
-  message: string;
-  reasoningEffort?: string;
-}
+// Profiles entered interactively at runtime. Held in memory for the session
+// only — exactly like env vars (process memory), just sourced from keystrokes.
+// We never write them to disk, honouring the read-only-secrets invariant.
+const sessionProfiles = new Map<string, ResolvedProfile>();
 
-const PROVIDERS: Record<ProviderKind, ProviderInfo> = {
-  claude: {
-    cli: 'claude',
-    aliases: ['claude'],
-    detectArgs: ['--version'],
-    label: 'Claude Code',
-    args: ({ model, sessionId, message }) => {
-      const args: string[] = [];
-      if (sessionId) args.push('--resume', sessionId);
-      args.push('--model', model);
-      args.push('--output-format', 'stream-json');
-      args.push('--verbose');
-      args.push('-p');
-      args.push('--dangerously-skip-permissions');
-      args.push(message);
-      return args;
-    },
-  },
-  opencode: {
-    cli: 'opencode',
-    aliases: ['opencode'],
-    detectArgs: ['--version'],
-    label: 'OpenCode',
-    args: ({ model, sessionId, message }) => {
-      // `opencode run [message..]` — non-interactive mode with JSON output.
-      // NOTE: `-p` on this subcommand means `--password`, NOT prompt; pass the
-      // message as a positional instead.
-      const args: string[] = ['run', '--format', 'json'];
-      if (model) args.push('-m', model);
-      if (sessionId) args.push('--session', sessionId);
-      args.push(message);
-      return args;
-    },
-  },
-  codex: {
-    cli: 'codex',
-    aliases: ['codex'],
-    detectArgs: ['--version'],
-    label: 'Codex (OpenAI)',
-    args: ({ model, sessionId, message }) => {
-      // `codex exec` is the non-interactive entry point. Session resumption is
-      // its own subcommand: `codex exec resume <id>`.
-      if (sessionId) {
-        return ['exec', 'resume', sessionId, '--json', '-m', model, message];
-      }
-      return ['exec', '--json', '-m', model, message];
-    },
-  },
-  gemini: {
-    cli: 'gemini',
-    aliases: ['gemini'],
-    detectArgs: ['--version'],
-    label: 'Gemini CLI',
-    args: ({ model, sessionId, message }) => {
-      const args: string[] = ['-m', model, '-o', 'stream-json', '-y'];
-      if (sessionId) args.push('-r', sessionId);
-      args.push('-p', message);
-      return args;
-    },
-  },
-};
-
-const execAsync = promisify(exec);
-
-export async function detectProviders(): Promise<{ provider: ProviderKind; path: string; version: string }[]> {
-  const found: { provider: ProviderKind; path: string; version: string }[] = [];
-  const entries = Object.entries(PROVIDERS);
-  const results = await Promise.allSettled(
-    entries.map(async ([kind, info]) => {
-      const { stdout } = await execAsync(`${info.cli} ${info.detectArgs.join(' ')}`, {
-        encoding: 'utf-8',
-        timeout: 5000,
-      });
-      return { provider: kind as ProviderKind, path: info.cli, version: (stdout || 'unknown').trim().split('\n')[0] };
-    }),
-  );
-  for (const r of results) {
-    if (r.status === 'fulfilled') found.push(r.value);
-  }
-  return found;
-}
-
-export function buildCommand(opts: ProviderBuildOpts & { provider: ProviderKind }): ProviderCommand {
-  const info = PROVIDERS[opts.provider];
-  return {
-    executable: info.cli,
-    args: info.args(opts),
+/** Register an endpoint entered interactively; returns the resolved profile. */
+export function registerSessionProfile(input: { baseUrl: string; apiKey: string; name?: string; defaultModel?: string }): ResolvedProfile {
+  const name = uniqueName(input.name ?? deriveName(input.baseUrl));
+  const resolved: ResolvedProfile = {
+    name,
+    label: humanizeProfileName(name),
+    baseUrl: input.baseUrl.trim(),
+    defaultModel: input.defaultModel,
+    apiKey: input.apiKey,
   };
+  sessionProfiles.set(name, resolved);
+  return resolved;
 }
 
-export function getProviderLabel(kind: ProviderKind): string {
-  return PROVIDERS[kind]?.label ?? kind;
+/**
+ * Save an endpoint to the on-disk config so it survives across sessions. Re-entry
+ * of the same derived name overwrites in place (handy for rotating a key); a
+ * clash with an env/session name is suffixed so it never shadows those.
+ */
+export function persistProfile(input: { baseUrl: string; apiKey: string; name?: string; defaultModel?: string }): ResolvedProfile {
+  const baseUrl = input.baseUrl.trim();
+  const base = input.name ?? deriveName(baseUrl);
+  const cfg = readConfig();
+  const name = cfg.profiles[base] ? base : uniqueName(base);
+  cfg.profiles[name] = { baseUrl, apiKey: input.apiKey, defaultModel: input.defaultModel };
+  writeConfig(cfg);
+  return { name, label: humanizeProfileName(name), baseUrl, defaultModel: input.defaultModel, apiKey: input.apiKey };
 }
 
-export function getDefaultModel(provider: ProviderKind): string {
-  return MODEL_CATALOGS[provider]?.[0]?.model ?? provider;
+/** Add an interactively-entered endpoint, persisting it only if the user opts in. */
+export function addEndpoint(input: { baseUrl: string; apiKey: string; remember: boolean; name?: string; defaultModel?: string }): ResolvedProfile {
+  return input.remember ? persistProfile(input) : registerSessionProfile(input);
 }
+
+/** Saved (persisted) profiles only, secrets stripped — for the /config manager. */
+export function persistedProfiles(): Profile[] {
+  return loadPersistedProfiles();
+}
+
+export function isProfilePersisted(name: string): boolean {
+  return name in readConfig().profiles;
+}
+
+/** Delete a saved profile from disk. Returns false if it wasn't saved. */
+export function forgetProfile(name: string): boolean {
+  const cfg = readConfig();
+  if (!(name in cfg.profiles)) return false;
+  delete cfg.profiles[name];
+  writeConfig(cfg);
+  return true;
+}
+
+function deriveName(baseUrl: string): string {
+  try {
+    const host = new URL(baseUrl).hostname;
+    const skip = new Set(['api', 'open', 'www', 'gateway', 'ark', 'dashscope']);
+    const label = host.split('.').find(p => !skip.has(p)) ?? host;
+    return label.toLowerCase();
+  } catch {
+    return 'custom';
+  }
+}
+
+function uniqueName(base: string): string {
+  const taken = new Set(loadProfiles().map(p => p.name));
+  if (!taken.has(base)) return base;
+  let i = 2;
+  while (taken.has(`${base}-${i}`)) i++;
+  return `${base}-${i}`;
+}
+
+/** Discover every ready profile from the environment (no secrets returned). */
+export function loadProfiles(): Profile[] {
+  const names = new Set<string>();
+  for (const key of Object.keys(process.env)) {
+    if (!key.startsWith(PROFILE_PREFIX)) continue;
+    const suffix = PROFILE_SUFFIXES.find(s => key.endsWith(s));
+    if (!suffix) continue;
+    names.add(key.slice(PROFILE_PREFIX.length, key.length - suffix.length));
+  }
+
+  const profiles: Profile[] = [];
+  for (const raw of names) {
+    const key = envValue(`${PROFILE_PREFIX}${raw}_KEY`);
+    if (!key) continue; // not ready — no secret
+    profiles.push({
+      name: raw.toLowerCase(),
+      label: humanizeProfileName(raw),
+      baseUrl: envValue(`${PROFILE_PREFIX}${raw}_BASE_URL`) ?? '',
+      defaultModel: envValue(`${PROFILE_PREFIX}${raw}_MODEL`),
+    });
+  }
+
+  // Implicit official Anthropic endpoint.
+  if (envValue('ANTHROPIC_API_KEY') && !profiles.some(p => p.name === 'anthropic')) {
+    profiles.push({
+      name: 'anthropic',
+      label: 'Anthropic',
+      baseUrl: envValue('ANTHROPIC_BASE_URL') ?? '',
+      defaultModel: envValue('ANTHROPIC_MODEL'),
+    });
+  }
+
+  // Session profiles entered interactively (secrets stripped from the listing).
+  for (const sp of sessionProfiles.values()) {
+    if (!profiles.some(p => p.name === sp.name)) {
+      profiles.push({ name: sp.name, label: sp.label, baseUrl: sp.baseUrl, defaultModel: sp.defaultModel });
+    }
+  }
+
+  // Saved profiles from the on-disk config (secrets stripped from the listing).
+  for (const sp of loadPersistedProfiles()) {
+    if (!profiles.some(p => p.name === sp.name)) profiles.push(sp);
+  }
+
+  profiles.sort((a, b) => a.label.localeCompare(b.label));
+  return profiles;
+}
+
+/** Saved profiles from the on-disk config, secrets stripped. */
+function loadPersistedProfiles(): Profile[] {
+  return Object.entries(readConfig().profiles).map(([name, p]) => ({
+    name,
+    label: humanizeProfileName(name),
+    baseUrl: p.baseUrl,
+    defaultModel: p.defaultModel,
+  }));
+}
+
+/** Resolve a profile *with* its secret, for use at turn time. */
+export function resolveProfile(name: string): ResolvedProfile | undefined {
+  const session = sessionProfiles.get(name);
+  if (session) return session;
+  const base = loadProfiles().find(p => p.name === name);
+  if (!base) return undefined;
+
+  // Environment takes precedence over a saved key with the same name.
+  const envKey = name === 'anthropic'
+    ? envValue('ANTHROPIC_API_KEY')
+    : envValue(`${PROFILE_PREFIX}${name.toUpperCase()}_KEY`);
+  if (envKey) return { ...base, apiKey: envKey };
+
+  const stored = readConfig().profiles[name];
+  if (stored?.apiKey) return { ...base, apiKey: stored.apiKey };
+
+  return undefined;
+}
+
+/**
+ * Build the per-call environment overlay for a single `query()`. Because the
+ * pair loop is strictly sequential, two roles on different endpoints never
+ * collide — each turn gets its own overlay. Both AUTH_TOKEN and API_KEY are set
+ * so official and third-party gateways are both satisfied.
+ */
+export function profileEnv(resolved: ResolvedProfile): Record<string, string> {
+  const env: Record<string, string> = {
+    ANTHROPIC_API_KEY: resolved.apiKey,
+    ANTHROPIC_AUTH_TOKEN: resolved.apiKey,
+  };
+  if (resolved.baseUrl) env.ANTHROPIC_BASE_URL = resolved.baseUrl;
+  return env;
+}
+
+export function profileLabel(name: string): string {
+  return loadProfiles().find(p => p.name === name)?.label ?? humanizeProfileName(name);
+}
+
+// ── Model suggestions ───────────────────────────────────────────────────
+// We can't enumerate an arbitrary Anthropic-compatible endpoint, so we offer a
+// curated, brand-keyed suggestion list and always let the user type a custom id.
 
 export interface ModelOption {
   model: string;
   label: string;
   tier?: 'flagship' | 'standard' | 'fast' | 'light';
-  /**
-   * Upstream provider name when relevant (e.g. OpenCode routes a single
-   * model id through multiple back-ends like anthropic / openrouter / groq).
-   * Used to disambiguate identical labels and as a fuzzy-search keyword.
-   */
-  subProvider?: string;
 }
 
-// Static fallback catalog — used when CLI-side discovery fails (e.g. CLI not
-// authenticated, network down, or no `models` command).
-export const MODEL_CATALOGS: Record<ProviderKind, ModelOption[]> = {
-  claude: [
-    { model: 'claude-opus-4-20250514', label: 'Opus 4', tier: 'flagship' },
-    { model: 'claude-sonnet-4-20250514', label: 'Sonnet 4', tier: 'standard' },
-    { model: 'claude-haiku-4-20250514', label: 'Haiku 4', tier: 'fast' },
-  ],
-  opencode: [
-    { model: 'opencode/claude-sonnet-4-6', label: 'Claude Sonnet 4.6', tier: 'standard', subProvider: 'opencode' },
-    { model: 'opencode/claude-opus-4-7',   label: 'Claude Opus 4.7',  tier: 'flagship', subProvider: 'opencode' },
-    { model: 'opencode/gpt-5.1',           label: 'GPT-5.1',          tier: 'standard', subProvider: 'opencode' },
-    { model: 'opencode/gemini-3.1-pro',    label: 'Gemini 3.1 Pro',   tier: 'flagship', subProvider: 'opencode' },
-  ],
-  codex: [
-    { model: 'gpt-5.1', label: 'GPT-5.1', tier: 'flagship' },
-    { model: 'gpt-5.1-codex', label: 'GPT-5.1 Codex', tier: 'flagship' },
-    { model: 'gpt-5.1-codex-mini', label: 'GPT-5.1 Codex Mini', tier: 'fast' },
-    { model: 'o4-mini', label: 'o4-mini', tier: 'standard' },
-  ],
-  gemini: [
-    { model: 'gemini-3-pro', label: 'Gemini 3 Pro', tier: 'flagship' },
-    { model: 'gemini-3-flash', label: 'Gemini 3 Flash', tier: 'fast' },
-    { model: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', tier: 'standard' },
-  ],
-};
+const SUGGESTIONS: Array<{ match: RegExp; models: string[] }> = [
+  { match: /anthropic|claude/, models: ['claude-opus-4-1', 'claude-sonnet-4-5', 'claude-haiku-4-5'] },
+  { match: /deepseek/, models: ['deepseek-chat', 'deepseek-reasoner'] },
+  { match: /glm|zhipu|bigmodel/, models: ['glm-4.6', 'glm-4.5-air'] },
+  { match: /kimi|moonshot/, models: ['kimi-k2-0905-preview', 'moonshot-v1-128k'] },
+  { match: /qwen|dashscope|bailian/, models: ['qwen3-max', 'qwen3-coder-plus', 'qwen-plus'] },
+  { match: /minimax/, models: ['MiniMax-M2', 'abab6.5s-chat'] },
+  { match: /openrouter/, models: ['anthropic/claude-sonnet-4.5', 'deepseek/deepseek-chat'] },
+];
 
-export function getModelsForProvider(provider: ProviderKind): ModelOption[] {
-  return MODEL_CATALOGS[provider] ?? [];
-}
+/** Suggested models for a profile; the profile's own default is pinned first. */
+export function suggestModels(profileName: string, defaultModel?: string): ModelOption[] {
+  const out: ModelOption[] = [];
+  const seen = new Set<string>();
+  const push = (model: string) => {
+    if (seen.has(model)) return;
+    seen.add(model);
+    out.push({ model, label: humanizeModelId(model), tier: inferTier(model) });
+  };
 
-// ── Runtime model discovery ─────────────────────────────────────────────
-
-const MODEL_DISCOVERY_TIMEOUT_MS = 8_000;
-const discoveryCache = new Map<ProviderKind, ModelOption[]>();
-
-/**
- * Probe the underlying CLI for the real model list. Returns the discovered
- * models, or throws if the CLI doesn't expose a model listing in a form we
- * can parse. Callers should catch and fall back to the static catalog.
- */
-export async function discoverModels(provider: ProviderKind): Promise<ModelOption[]> {
-  const cached = discoveryCache.get(provider);
-  if (cached) return cached;
-
-  let result: ModelOption[];
-  switch (provider) {
-    case 'opencode': result = await discoverOpenCodeModels(); break;
-    case 'claude':   result = await discoverClaudeModels();   break;
-    case 'codex':    result = await discoverCodexModels();    break;
-    case 'gemini':   result = await discoverGeminiModels();   break;
-    default:         throw new Error(`No discovery for provider: ${provider}`);
+  if (defaultModel) push(defaultModel);
+  for (const s of SUGGESTIONS) {
+    if (s.match.test(profileName)) s.models.forEach(push);
   }
-  if (result.length === 0) throw new Error(`Empty model list from ${provider}`);
-  discoveryCache.set(provider, result);
-  return result;
+  return out;
 }
 
-/** Clear the in-process discovery cache (used by /providers refresh). */
-export function clearModelDiscoveryCache(): void {
-  discoveryCache.clear();
-}
+// ── Display helpers ─────────────────────────────────────────────────────
 
-async function discoverOpenCodeModels(): Promise<ModelOption[]> {
-  // `opencode models` outputs `<sub-provider>/<model-id>` lines.
-  // It can be slow on first run because it warms the models.dev cache.
-  const { stdout } = await execAsync('opencode models', {
-    encoding: 'utf-8',
-    timeout: MODEL_DISCOVERY_TIMEOUT_MS,
-    maxBuffer: 4 * 1024 * 1024,
-  });
-
-  const lines = stdout
-    .split('\n')
-    .map(l => l.trim())
-    .filter(l => l && l.includes('/'));
-
-  return lines.map(line => {
-    const slash = line.indexOf('/');
-    const sub = line.slice(0, slash);
-    const id = line.slice(slash + 1);
-    return {
-      model: line,
-      label: humanizeModelId(id),
-      tier: inferTier(id),
-      subProvider: sub,
-    };
-  });
-}
-
-async function discoverClaudeModels(): Promise<ModelOption[]> {
-  const tryCommands = ['claude models list', 'claude --list-models'];
-  for (const cmd of tryCommands) {
-    try {
-      const { stdout } = await execAsync(cmd, {
-        encoding: 'utf-8',
-        timeout: MODEL_DISCOVERY_TIMEOUT_MS,
-      });
-      const lines = stdout
-        .split('\n')
-        .map(l => l.trim())
-        .filter(l => l && /^claude-/.test(l));
-      if (lines.length > 0) {
-        return lines.map(id => ({ model: id, label: humanizeModelId(id), tier: inferTier(id) }));
-      }
-    } catch {
-      // try next command form
-    }
+function humanizeProfileName(raw: string): string {
+  const lower = raw.toLowerCase();
+  for (const brand in KNOWN_BRANDS) {
+    if (lower.startsWith(brand)) return KNOWN_BRANDS[brand];
   }
-  throw new Error('claude CLI did not expose a model list');
-}
-
-async function discoverCodexModels(): Promise<ModelOption[]> {
-  // Codex does not currently ship a `models` subcommand. Fall back.
-  throw new Error('codex CLI does not expose a model list');
-}
-
-async function discoverGeminiModels(): Promise<ModelOption[]> {
-  // Gemini CLI currently has no model list command. Fall back.
-  throw new Error('gemini CLI does not expose a model list');
+  return raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase();
 }
 
 function inferTier(id: string): ModelOption['tier'] {
   const lower = id.toLowerCase();
-  if (/\b(opus|pro|max|flagship|big|ultra)\b/.test(lower)) return 'flagship';
-  if (/\b(haiku|mini|flash|nano|fast|small|light)\b/.test(lower)) return 'fast';
+  if (/\b(opus|pro|max|flagship|ultra|m2|reasoner)\b/.test(lower)) return 'flagship';
+  if (/\b(haiku|mini|flash|nano|fast|small|light|air)\b/.test(lower)) return 'fast';
   if (/\b(free|tiny)\b/.test(lower)) return 'light';
   return 'standard';
 }
@@ -261,42 +256,38 @@ function inferTier(id: string): ModelOption['tier'] {
 const KNOWN_BRANDS: Record<string, string> = {
   gpt: 'GPT',
   glm: 'GLM',
-  llm: 'LLM',
   llama: 'Llama',
   qwen: 'Qwen',
   kimi: 'Kimi',
   gemini: 'Gemini',
   gemma: 'Gemma',
   claude: 'Claude',
+  anthropic: 'Anthropic',
   grok: 'Grok',
   deepseek: 'DeepSeek',
   minimax: 'MiniMax',
-  nemotron: 'Nemotron',
+  moonshot: 'Moonshot',
+  openrouter: 'OpenRouter',
+  zhipu: 'Zhipu',
 };
 
-// Known acronyms that should stay fully uppercase when they appear as a
-// stand-alone segment (e.g. "gpt-4" → "GPT 4").
-const ACRONYMS = new Set(['gpt', 'glm', 'llm', 'gpu', 'cpu', 'tts', 'stt', 'ocr']);
+const ACRONYMS = new Set(['gpt', 'glm', 'llm', 'tts', 'stt', 'ocr', 'ai']);
 
 function formatSegment(part: string): string {
   const lower = part.toLowerCase();
   if (ACRONYMS.has(lower)) return lower.toUpperCase();
   for (const brand in KNOWN_BRANDS) {
-    if (lower.startsWith(brand)) {
-      return KNOWN_BRANDS[brand] + part.slice(brand.length);
-    }
+    if (lower.startsWith(brand)) return KNOWN_BRANDS[brand] + part.slice(brand.length);
   }
   if (/^\d/.test(part)) return part;
   return part.charAt(0).toUpperCase() + part.slice(1);
 }
 
-function humanizeModelId(id: string): string {
+export function humanizeModelId(id: string): string {
   const last = id.split('/').pop() ?? id;
   const parts = last.split('-');
   const out: string[] = [];
   for (const part of parts) {
-    // Merge adjacent numeric segments into a single dotted version
-    // (e.g. "claude-opus-4-7" → "Claude Opus 4.7").
     if (/^\d+$/.test(part) && out.length > 0 && /^[\d.]+$/.test(out[out.length - 1])) {
       out[out.length - 1] = out[out.length - 1] + '.' + part;
       continue;
