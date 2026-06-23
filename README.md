@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/timwuhaotian/pair-cli/main/assets/icon.svg" width="128" height="128" alt="Pair Code icon" />
+  <img src="https://raw.githubusercontent.com/timwuhaotian/pair-code/main/assets/icon.svg" width="128" height="128" alt="Pair Code icon" />
 </p>
 
 <h1 align="center">Pair Code</h1>
@@ -11,12 +11,16 @@
 <p align="center">
   <a href="https://www.npmjs.com/package/pair-code"><img src="https://img.shields.io/npm/v/pair-code?color=cb007d&label=npm" alt="npm version" /></a>
   <img src="https://img.shields.io/badge/node-%E2%89%A520-339933" alt="node" />
-  <img src="https://img.shields.io/github/license/timwuhaotian/pair-cli?color=blue" alt="license" />
-  <a href="https://github.com/timwuhaotian/pair-cli/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/timwuhaotian/pair-cli/ci.yml?branch=main&label=ci" alt="CI status" /></a>
+  <img src="https://img.shields.io/github/license/timwuhaotian/pair-code?color=blue" alt="license" />
+  <a href="https://github.com/timwuhaotian/pair-code/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/timwuhaotian/pair-code/ci.yml?branch=main&label=ci" alt="CI status" /></a>
 </p>
 
 <p align="center">
   Two AI agents — a <strong>Mentor</strong> (planner/reviewer) and an <strong>Executor</strong> (coder) — collaborate on your task while you watch. Go grab a coffee, come back to reviewed code.
+</p>
+
+<p align="center">
+  Terminal edition of <a href="https://github.com/timwuhaotian/the-pair"><strong>The Pair</strong></a>. Prefer a desktop app? <a href="https://github.com/timwuhaotian/the-pair/releases">Download The Pair</a>.
 </p>
 
 ---
@@ -33,6 +37,8 @@
 npm install -g pair-code
 ```
 
+Prefer a visual desktop app with installers, session monitoring, and screenshots? Use [The Pair](https://github.com/timwuhaotian/the-pair).
+
 ## Quick Start
 
 ```bash
@@ -40,16 +46,16 @@ npm install -g pair-code
 export ANTHROPIC_API_KEY=sk-ant-...
 
 # Run in the current directory
-pair-code . "Fix the login bug in auth.ts"
+pair . "Fix the login bug in auth.ts"
 
 # Run in a specific project
-pair-code ~/projects/api "Add rate limiting middleware"
+pair ~/projects/api "Add rate limiting middleware"
 
 # List configured endpoint profiles
-pair-code providers
+pair providers
 ```
 
-The CLI is installed as both `pair-code` and the shorter `pair` — the two are interchangeable.
+Use `pair` as the primary command; `pair-code` remains available as a compatibility alias.
 
 ## How It Works
 
@@ -132,7 +138,8 @@ Then select DeepSeek for the Mentor and Kimi for the Executor in the setup wizar
 | `/resume` | Continue a paused session |
 | `/config` | Configure endpoints, models & saved credentials |
 | `/mentor` | Re-select mentor profile & model |
-| `/runner` | Re-select executor profile & model |
+| `/executor` | Re-select executor profile & model |
+| `/runner` | Alias for `/executor` |
 | `/model` | Show current model configuration |
 | `/status` | Show pair status & iteration info |
 | `/files` | List modified files |
@@ -145,8 +152,8 @@ Then select DeepSeek for the Mentor and Kimi for the Executor in the setup wizar
 ## Development
 
 ```bash
-git clone https://github.com/timwuhaotian/pair-cli.git
-cd pair-cli
+git clone https://github.com/timwuhaotian/pair-code.git
+cd pair-code
 npm install
 
 npm run build       # tsup → dist/ (ESM, node20)
@@ -159,7 +166,15 @@ npm run start       # build then run dist/index.js
 npx tsx scripts/preview.tsx
 ```
 
-**No test framework is configured.** To verify changes, run `npm run typecheck`, render `scripts/preview.tsx`, and exercise the CLI manually against a real endpoint.
+Focused CLI tests use Node's built-in test runner directly:
+`node --import tsx --test tests/*.test.tsx`.
+There is still no `npm test` script; for broader checks, run `npm run typecheck`, render `scripts/preview.tsx`, and exercise the CLI manually against a real endpoint.
+
+### Release Automation
+
+CI runs `typecheck`, `lint`, and `build` on pull requests and pushes to `main`. The release workflow runs on `main` version changes or manual dispatch, validates the package, runs `npm pack --dry-run`, skips versions already published to npm, publishes `pair-code` with npm provenance, and creates the matching GitHub release.
+
+To release, update `package.json` and `CHANGELOG.md`, merge to `main`, and ensure the repository has an `NPM_TOKEN` secret with publish rights for `pair-code`. Manual dispatch defaults to a dry run; set `dry_run=false` to publish the current version.
 
 ### Project Structure
 
@@ -220,4 +235,4 @@ please don't open a public issue for security reports.
 
 ## Releases
 
-See the [releases page](https://github.com/timwuhaotian/pair-cli/releases) for changelogs and download artifacts.
+See the [releases page](https://github.com/timwuhaotian/pair-code/releases) for changelogs and download artifacts.

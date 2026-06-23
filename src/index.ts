@@ -22,6 +22,8 @@ const VERSION = ((): string => {
   }
 })();
 
+const CLI_NAME = 'pair';
+
 // Single source of truth for the flags we accept, so #43 (unknown-flag
 // detection) and the help text can't disagree about what's recognized.
 const HELP_FLAGS = ['--help', '-h'] as const;
@@ -30,12 +32,12 @@ const KNOWN_FLAGS = new Set<string>([...HELP_FLAGS, ...VERSION_FLAGS]);
 
 function printUsage(): void {
   console.log(`
-pair-code v${VERSION}
+${CLI_NAME} v${VERSION}
 Dual-agent AI pair programming for the terminal (Claude Agent SDK)
 
 Usage:
-  pair-code [directory] [task description]
-  pair-code providers       List configured endpoint profiles
+  ${CLI_NAME} [directory] [task description]
+  ${CLI_NAME} providers       List configured endpoint profiles
 
 Options:
   -h, --help      Show this help
@@ -53,8 +55,8 @@ Env vars take precedence over a saved profile of the same name. Manage saved
 credentials in-app with /config; env stays the way to skip the prompt entirely.
 
 Examples:
-  pair-code . "Fix the login bug in auth.ts"
-  pair-code ~/projects/api "Add rate limiting middleware"
+  ${CLI_NAME} . "Fix the login bug in auth.ts"
+  ${CLI_NAME} ~/projects/api "Add rate limiting middleware"
 `);
 }
 
@@ -100,7 +102,7 @@ function main(): void {
 
   // Informational flags first so they keep working even when stdin is piped.
   if (args.some(a => (HELP_FLAGS as readonly string[]).includes(a))) { printUsage(); process.exit(0); }
-  if (args.some(a => (VERSION_FLAGS as readonly string[]).includes(a))) { console.log(`pair-code v${VERSION}`); process.exit(0); }
+  if (args.some(a => (VERSION_FLAGS as readonly string[]).includes(a))) { console.log(`${CLI_NAME} v${VERSION}`); process.exit(0); }
   if (args[0] === 'providers') { printProfiles(); process.exit(0); }
 
   // Reject unrecognized dash-flags instead of silently dropping them. (#43)
@@ -115,7 +117,7 @@ function main(): void {
   // raw-mode error. Fail fast with a clear message. Must come after the
   // informational handlers above so those still work when piped. (#3/#16/#21)
   if (!process.stdin.isTTY) {
-    console.error('pair-code is interactive and needs a TTY (stdin is not a terminal).');
+    console.error(`${CLI_NAME} is interactive and needs a TTY (stdin is not a terminal).`);
     process.exit(1);
   }
 

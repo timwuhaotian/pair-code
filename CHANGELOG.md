@@ -40,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Project icon, CONTRIBUTING.md, CODE_OF_CONDUCT.md, issue templates, PR template.
 
 ### Changed
-- Repository URL corrected to `https://github.com/timwuhaotian/pair-cli.git`.
+- Repository URL corrected to `https://github.com/timwuhaotian/pair-code.git`.
 - README rewritten with prerequisites, provider table, configuration docs, development setup, and project structure.
 - Roles are now asymmetric and SDK-enforced: Mentor is read-only (`Read`, `Grep`, `Glob`), Executor has full tools.
 

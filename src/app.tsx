@@ -17,7 +17,8 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'resume', description: 'Continue a paused session' },
   { name: 'config', description: 'Configure endpoints, models & saved credentials' },
   { name: 'mentor', description: 'Re-select mentor profile & model' },
-  { name: 'runner', description: 'Re-select executor profile & model' },
+  { name: 'executor', description: 'Re-select executor profile & model' },
+  { name: 'runner', description: 'Alias for /executor' },
   { name: 'model', description: 'Show current model configuration' },
   { name: 'status', description: 'Show pair status & iteration info' },
   { name: 'files', description: 'List modified files' },
@@ -25,8 +26,12 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'profiles', description: 'List configured endpoint profiles' },
   { name: 'clear', description: 'Clear the screen' },
   { name: 'help', description: 'Show available commands' },
-  { name: 'quit', description: 'Exit pair-code' },
+  { name: 'quit', description: 'Exit pair' },
 ];
+
+const SETUP_SLASH_COMMANDS = SLASH_COMMANDS.filter(c =>
+  ['task', 'config', 'mentor', 'executor', 'runner', 'model', 'profiles', 'clear', 'help', 'quit'].includes(c.name),
+);
 
 interface RolePick { profileName: string; baseUrl: string; model: string }
 
@@ -189,35 +194,121 @@ function SetupWizard(props: {
   initialSpec: string;
   onDone: (state: PairState) => void;
 }): JSX.Element {
+  const { exit } = useApp();
+  const { write } = useStdout();
   const [spec, setSpec] = useState(props.initialSpec);
   const [step, setStep] = useState<'spec' | 'mentor' | 'executor'>(props.initialSpec ? 'mentor' : 'spec');
-  const mentorRef = useRef<RolePick | null>(null);
+  const [mentorPick, setMentorPick] = useState<RolePick | null>(null);
+  const [executorPick, setExecutorPick] = useState<RolePick | null>(null);
+  const [overlay, setOverlay] = useState<null | 'mentor' | 'runner' | 'config' | 'creds'>(null);
+  const [notice, setNotice] = useState<ReactNode | null>(null);
   // Read fresh each render so an endpoint added via "+ Add" during one role's
   // pick is immediately available to the other role.
   const profiles = loadProfiles();
 
-  if (step === 'spec') {
+  const mentorHint = mentorPick ? `${profileLabel(mentorPick.profileName)} / ${mentorPick.model}` : 'not set';
+  const executorHint = executorPick ? `${profileLabel(executorPick.profileName)} / ${executorPick.model}` : 'not set';
+
+  const complete = (nextSpec: string, mentor: RolePick, executor: RolePick) => {
+    let s = createPairState({
+      directory: props.directory,
+      spec: nextSpec,
+      mentor: { role: 'mentor', profileName: mentor.profileName, baseUrl: mentor.baseUrl, model: mentor.model },
+      executor: { role: 'executor', profileName: executor.profileName, baseUrl: executor.baseUrl, model: executor.model },
+    });
+    s = addMessage(s, { from: 'human', to: 'mentor', type: 'feedback', content: nextSpec });
+    props.onDone(s);
+  };
+
+  const submitSpec = (nextSpec: string) => {
+    const trimmed = nextSpec.trim();
+    if (!trimmed) return;
+    setSpec(trimmed);
+    if (!mentorPick) { setStep('mentor'); return; }
+    if (!executorPick) { setStep('executor'); return; }
+    complete(trimmed, mentorPick, executorPick);
+  };
+
+  const header = (
+    <Box flexDirection="column" marginBottom={1}>
+      <Text><Text color={colors.accent} dimColor>─── Agent Configuration ───</Text></Text>
+      <Text><Text color={colors.human}>{icons.human} task     </Text><Text dimColor>{spec ? truncate(spec, 60) : 'not set'}</Text></Text>
+      <Text><Text color={colors.mentor}>{icons.mentor} mentor   </Text><Text dimColor>{mentorHint}</Text></Text>
+      <Text><Text color={colors.executor}>{icons.executor} executor </Text><Text dimColor>{executorHint}</Text></Text>
+    </Box>
+  );
+
+  const setRoleFromOverlay = (role: 'mentor' | 'executor', pick: RolePick) => {
+    const nextMentor = role === 'mentor' ? pick : mentorPick;
+    const nextExecutor = role === 'executor' ? pick : executorPick;
+    if (role === 'mentor') setMentorPick(pick);
+    else setExecutorPick(pick);
+    setOverlay(null);
+    setNotice(<Text color={role === 'mentor' ? colors.mentor : colors.executor}>{icons.check} {role} → {profileLabel(pick.profileName)} / {pick.model}</Text>);
+    if (spec.trim() && nextMentor && nextExecutor) complete(spec.trim(), nextMentor, nextExecutor);
+  };
+
+  const handleSetupLine = (line: string) => {
+    setNotice(null);
+    if (!line.startsWith('/')) { submitSpec(line); return; }
+    const [cmd, ...rest] = line.slice(1).split(/\s+/);
+    const arg = rest.join(' ').trim();
+    switch (cmd) {
+      case 'quit': case 'exit': exit(); break;
+      case 'config': setOverlay('config'); break;
+      case 'mentor': setOverlay('mentor'); break;
+      case 'executor': case 'runner': setOverlay('runner'); break;
+      case 'task': if (arg) submitSpec(arg); else setNotice(<Text dimColor>Usage: /task &lt;spec&gt;</Text>); break;
+      case 'model': setNotice(
+        <Box flexDirection="column">
+          <Text><Text color={colors.mentor}>{icons.mentor} Mentor   </Text>{mentorHint}</Text>
+          <Text><Text color={colors.executor}>{icons.executor} Executor </Text>{executorHint}</Text>
+        </Box>); break;
+      case 'profiles': setNotice(<Text dimColor>{profiles.map(p => p.label).join(' · ') || 'No profiles configured.'}</Text>); break;
+      case 'help': setNotice(
+        <Box flexDirection="column">{SETUP_SLASH_COMMANDS.map(c => <Text key={c.name}><Text color={colors.accent}>/{c.name}</Text><Text dimColor>{' '.repeat(Math.max(1, 10 - c.name.length))}{c.description}</Text></Text>)}</Box>); break;
+      case 'clear': write('\x1B[2J\x1B[3J\x1B[H'); break;
+      default: setNotice(<Text color={colors.error}>Unknown command: /{cmd}</Text>);
+    }
+  };
+
+  if (overlay === 'config') {
+    return <ConfigMenu mentorHint={mentorHint} executorHint={executorHint} onPick={(o) => setOverlay(o)} onClose={() => setOverlay(null)} />;
+  }
+
+  if (overlay === 'creds') {
+    return <CredsManager onBack={() => setOverlay('config')} onNotice={setNotice} />;
+  }
+
+  if (overlay === 'mentor' || overlay === 'runner') {
+    const role = overlay === 'mentor' ? 'mentor' : 'executor';
     return (
-      <Box flexDirection="column">
-        <Text dimColor>  cwd {props.directory}</Text>
-        <TextPrompt
-          message="What should the agents work on?"
-          placeholder="describe the task"
-          onSubmit={(s) => { setSpec(s); setStep('mentor'); }}
+      <Box flexDirection="column" marginY={1}>
+        <RolePicker
+          roleLabel={role === 'mentor' ? 'Mentor' : 'Executor'}
+          roleSubtitle={role === 'mentor' ? 'planner & reviewer' : 'coder & implementer'}
+          profiles={profiles}
+          defaultProfileIndex={Math.max(0, profiles.findIndex(p => p.name === (role === 'mentor' ? mentorPick?.profileName : executorPick?.profileName)))}
+          sameAs={role === 'executor' && mentorPick
+            ? { pick: mentorPick, hint: `${profileLabel(mentorPick.profileName)} / ${mentorPick.model}` }
+            : null}
+          onCancel={() => setOverlay(null)}
+          onDone={(pick) => setRoleFromOverlay(role, pick)}
         />
       </Box>
     );
   }
 
-  const header = (
-    <Box flexDirection="column" marginBottom={1}>
-      <Text><Text color={colors.accent} dimColor>─── Agent Configuration ───</Text></Text>
-      <Text><Text color={colors.human}>{icons.human} task   </Text><Text dimColor>{truncate(spec, 60)}</Text></Text>
-      {mentorRef.current
-        ? <Text><Text color={colors.mentor}>{icons.mentor} mentor </Text><Text dimColor>{profileLabel(mentorRef.current.profileName)} / {mentorRef.current.model}</Text></Text>
-        : <Text><Text color={colors.mentor}>{icons.mentor} mentor </Text><Text dimColor>choosing…</Text></Text>}
-    </Box>
-  );
+  if (step === 'spec') {
+    return (
+      <Box flexDirection="column">
+        {header}
+        <Text dimColor>  cwd {props.directory}</Text>
+        {notice ? <Box marginY={1}>{notice}</Box> : null}
+        <SlashInput commands={SETUP_SLASH_COMMANDS} onSubmit={handleSetupLine} placeholder="type a task, or / for commands" />
+      </Box>
+    );
+  }
 
   if (step === 'mentor') {
     return (
@@ -226,8 +317,8 @@ function SetupWizard(props: {
         <RolePicker
           roleLabel="Mentor" roleSubtitle="planner & reviewer"
           profiles={profiles} defaultProfileIndex={0}
-          onCancel={() => { mentorRef.current = null; setStep('spec'); }}
-          onDone={(pick) => { mentorRef.current = pick; setStep('executor'); }}
+          onCancel={() => setStep('spec')}
+          onDone={(pick) => { setMentorPick(pick); setStep('executor'); }}
         />
       </Box>
     );
@@ -239,19 +330,13 @@ function SetupWizard(props: {
       <RolePicker
         roleLabel="Executor" roleSubtitle="coder & implementer"
         profiles={profiles} defaultProfileIndex={Math.min(1, profiles.length - 1)}
-        sameAs={mentorRef.current ? { pick: mentorRef.current, hint: `${profileLabel(mentorRef.current.profileName)} / ${mentorRef.current.model}` } : null}
+        sameAs={mentorPick ? { pick: mentorPick, hint: `${profileLabel(mentorPick.profileName)} / ${mentorPick.model}` } : null}
         highlightSameAs
-        onCancel={() => { mentorRef.current = null; setStep('mentor'); }}
+        onCancel={() => setStep(mentorPick ? 'spec' : 'mentor')}
         onDone={(pick) => {
-          const mentor = mentorRef.current!;
-          let s = createPairState({
-            directory: props.directory,
-            spec,
-            mentor: { role: 'mentor', profileName: mentor.profileName, baseUrl: mentor.baseUrl, model: mentor.model },
-            executor: { role: 'executor', profileName: pick.profileName, baseUrl: pick.baseUrl, model: pick.model },
-          });
-          s = addMessage(s, { from: 'human', to: 'mentor', type: 'feedback', content: spec });
-          props.onDone(s);
+          setExecutorPick(pick);
+          if (mentorPick && spec.trim()) complete(spec.trim(), mentorPick, pick);
+          else setStep('spec');
         }}
       />
     </Box>
@@ -262,7 +347,8 @@ function SetupWizard(props: {
 
 /** Top-level /config menu: route to a role picker or the saved-creds manager. */
 function ConfigMenu(props: {
-  state: PairState;
+  mentorHint: string;
+  executorHint: string;
   onPick: (overlay: 'mentor' | 'runner' | 'creds') => void;
   onClose: () => void;
 }): JSX.Element {
@@ -272,8 +358,8 @@ function ConfigMenu(props: {
       <Select
         message="Configure"
         items={[
-          { label: 'Mentor endpoint & model', value: 'mentor', hint: `${profileLabel(props.state.mentor.profileName)} / ${props.state.mentor.model}` },
-          { label: 'Executor endpoint & model', value: 'runner', hint: `${profileLabel(props.state.executor.profileName)} / ${props.state.executor.model}` },
+          { label: 'Mentor endpoint & model', value: 'mentor', hint: props.mentorHint },
+          { label: 'Executor endpoint & model', value: 'runner', hint: props.executorHint },
           { label: 'Manage saved credentials', value: 'creds', hint: savedCount ? `${savedCount} saved` : 'none saved' },
           { label: 'Close', value: 'close' },
         ]}
@@ -426,7 +512,7 @@ function Session(props: { initialState: PairState }): JSX.Element {
       case 'quit': case 'exit': engine.requestStop(); killActiveTurn(); exit(); break;
       case 'config': setOverlay('config'); break;
       case 'mentor': setOverlay('mentor'); break;
-      case 'runner': setOverlay('runner'); break;
+      case 'executor': case 'runner': setOverlay('runner'); break;
       case 'task': if (arg) void runReplace(freshTask(state, arg)); else setNotice(<Text dimColor>Usage: /task &lt;spec&gt;</Text>); break;
       case 'hello':
         if (engine.running) setNotice(<Text dimColor>Finish or stop the current turn before /hello.</Text>);
@@ -462,7 +548,14 @@ function Session(props: { initialState: PairState }): JSX.Element {
   };
 
   if (overlay === 'config') {
-    return <ConfigMenu state={state} onPick={(o) => setOverlay(o)} onClose={() => setOverlay(null)} />;
+    return (
+      <ConfigMenu
+        mentorHint={`${profileLabel(state.mentor.profileName)} / ${state.mentor.model}`}
+        executorHint={`${profileLabel(state.executor.profileName)} / ${state.executor.model}`}
+        onPick={(o) => setOverlay(o)}
+        onClose={() => setOverlay(null)}
+      />
+    );
   }
 
   if (overlay === 'creds') {
@@ -538,25 +631,7 @@ function Session(props: { initialState: PairState }): JSX.Element {
 // ── Root ─────────────────────────────────────────────────────────────────
 
 export function App(props: { directory: string; initialSpec: string }): JSX.Element {
-  const [profiles, setProfiles] = useState<Profile[]>(() => loadProfiles());
   const [state, setState] = useState<PairState | null>(null);
-
-  // First run with nothing configured: connect an endpoint interactively rather
-  // than dead-ending on env-var instructions. The key is held in memory only.
-  if (profiles.length === 0) {
-    return (
-      <Box flexDirection="column">
-        <Banner />
-        <Box flexDirection="column" marginBottom={1}>
-          <Text><Text color={colors.accent}>{icons.sparkle} Let's connect an endpoint to get started.</Text></Text>
-          <Text dimColor>  Any Anthropic-compatible endpoint works — GLM, DeepSeek, Kimi, Qwen, a gateway, or the official API.</Text>
-          <Text dimColor>  You choose whether to save it on this machine or keep it only for this session.</Text>
-          <Text dimColor>  Tip: export PAIR_PROFILE_&lt;NAME&gt;_BASE_URL + _KEY to skip this next time.</Text>
-        </Box>
-        <EndpointForm onDone={({ baseUrl, apiKey, remember }) => { addEndpoint({ baseUrl, apiKey, remember }); setProfiles(loadProfiles()); }} />
-      </Box>
-    );
-  }
 
   if (!state) {
     return (

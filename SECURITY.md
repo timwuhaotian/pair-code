@@ -17,7 +17,7 @@ Please make sure you are on the latest version before reporting an issue.
 
 Report privately through either channel:
 
-- **GitHub** — open a [private security advisory](https://github.com/timwuhaotian/pair-cli/security/advisories/new)
+- **GitHub** — open a [private security advisory](https://github.com/timwuhaotian/pair-code/security/advisories/new)
   (Security → Advisories → "Report a vulnerability").
 - **Email** — gosingk@gmail.com.
 

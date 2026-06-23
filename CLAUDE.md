@@ -19,7 +19,7 @@ npm run typecheck  # tsc --noEmit
 npx tsx scripts/preview.tsx   # render the UX frames with sample data (no TTY/network) — use to iterate on the UI
 ```
 
-- **No test framework is configured.** Don't run `npm test`. To verify changes, run `npm run typecheck`, render `scripts/preview.tsx`, and exercise the CLI manually against a real Anthropic-compatible endpoint.
+- Focused CLI tests use Node's built-in test runner directly: `node --import tsx --test tests/*.test.tsx`. Don't run `npm test` unless a script is added. To verify broader changes, run `npm run typecheck`, render `scripts/preview.tsx`, and exercise the CLI manually against a real Anthropic-compatible endpoint.
 - **No formatter is configured.** Match surrounding style; don't add a formatter without asking.
 - Node `>=20.0.0` required.
 

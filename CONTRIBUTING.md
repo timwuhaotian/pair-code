@@ -5,8 +5,8 @@ Thanks for your interest in contributing! This guide covers the basics.
 ## Getting Started
 
 ```bash
-git clone https://github.com/timwuhaotian/pair-cli.git
-cd pair-cli
+git clone https://github.com/timwuhaotian/pair-code.git
+cd pair-code
 npm install
 ```
 

@@ -3,10 +3,20 @@ name: Release
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Validate the release without publishing to npm
+        type: boolean
+        default: true
 
 permissions:
   contents: write
   id-token: write # npm provenance
+
+concurrency:
+  group: npm-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -28,6 +38,13 @@ jobs:
       - name: Check version change
         id: version
         run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            NEW=$(jq -r '.version' package.json)
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "version=$NEW" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           OLD=$(git show HEAD~1:package.json 2>/dev/null | jq -r '.version' || echo "")
           NEW=$(jq -r '.version' package.json)
           echo "old=$OLD new=$NEW"
@@ -38,21 +55,43 @@ jobs:
             echo "version=$NEW" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build & verify
+      - name: Check npm publication
+        id: npm
         if: steps.version.outputs.changed == 'true'
+        run: |
+          if npm view pair-code@${{ steps.version.outputs.version }} version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "pair-code@${{ steps.version.outputs.version }} is already published."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build & verify
+        if: steps.version.outputs.changed == 'true' && steps.npm.outputs.published != 'true'
         run: |
           npm run typecheck
           npm run lint
           npm run build
+          npm pack --dry-run
+
+      - name: Check changelog entry
+        if: steps.version.outputs.changed == 'true' && steps.npm.outputs.published != 'true'
+        run: grep -F "## [${{ steps.version.outputs.version }}]" CHANGELOG.md
 
       - name: Publish to npm
-        if: steps.version.outputs.changed == 'true'
-        run: npm publish --access public --provenance
+        if: steps.version.outputs.changed == 'true' && steps.npm.outputs.published != 'true' && github.event.inputs.dry_run != 'true'
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN secret is required to publish."
+            exit 1
+          fi
+
+          npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create git tag & GitHub Release
-        if: steps.version.outputs.changed == 'true'
+        if: steps.version.outputs.changed == 'true' && steps.npm.outputs.published != 'true' && github.event.inputs.dry_run != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.version }}
