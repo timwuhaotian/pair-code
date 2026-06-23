@@ -92,7 +92,7 @@ jobs:
 
       - name: Create git tag & GitHub Release
         if: steps.version.outputs.changed == 'true' && steps.npm.outputs.published != 'true' && github.event.inputs.dry_run != 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: v${{ steps.version.outputs.version }}
