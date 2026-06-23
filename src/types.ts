@@ -91,6 +91,10 @@ export interface PairState {
   executor: AgentRuntime;
   messages: Message[];
   modifiedFiles: ModifiedFile[];
+  /** Result of the last git probe; non-'ok' means change tracking is disabled. */
+  gitStatus: 'ok' | 'no-repo' | 'no-git';
+  /** Accumulated USD cost across all completed turns (from each turn's usage). */
+  totalCostUsd: number;
   finishedAt?: number;
   createdAt: number;
   /** Last error message captured when status transitioned to 'error'. */

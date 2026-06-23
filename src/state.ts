@@ -6,8 +6,11 @@ const MENTOR_FINISH_SIGNAL = 'TASK_COMPLETE';
 // Same regex must be applied to BOTH the candidate line and the sentinel so
 // the comparison isn't asymmetric — otherwise the underscore in TASK_COMPLETE
 // gets stripped from the input but kept in the constant and the signal never
-// fires.
-const NORMALIZE_RE = /[`"'>_*\-:.,!?\[\](){}]/g;
+// fires. The class also strips whitespace (\s), markdown markers (# > * - …)
+// and ordered-list digits (\d) so '## TASK_COMPLETE', '- TASK_COMPLETE',
+// '1. TASK_COMPLETE' and '**TASK_COMPLETE**' all reduce to the bare token;
+// the whole-line equality below still rejects mid-sentence prose.
+const NORMALIZE_RE = /[`"'>_*\-:.,!?#\d\s\[\](){}]/g;
 const FINISH_NORMALIZED = MENTOR_FINISH_SIGNAL.replace(NORMALIZE_RE, '');
 
 const MAX_HISTORY_MESSAGES = 10;
@@ -47,6 +50,8 @@ export function createPairState(input: CreatePairInput): PairState {
     },
     messages: [],
     modifiedFiles: [],
+    gitStatus: 'ok',
+    totalCostUsd: 0,
     createdAt: nowMs(),
   };
 }
@@ -152,10 +157,47 @@ export function getConversationHistory(state: PairState): string {
     .join('\n\n');
 }
 
-export async function getGitChanges(directory: string): Promise<ModifiedFile[]> {
+// 64 MiB: large repos can emit name-status / ls-files output past the 1 MiB
+// execSync default, which otherwise throws ENOBUFS and silently drops changes.
+const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+
+/**
+ * Classify the directory's git state. Returns 'no-git' when the git binary is
+ * missing (ENOENT / command not found), 'no-repo' when git runs but the path
+ * isn't a work tree, and 'ok' otherwise.
+ */
+function probeGitStatus(directory: string): PairState['gitStatus'] {
   try {
-    const tracked = execSync('git diff --name-status HEAD', { cwd: directory, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
-    const untracked = execSync('git ls-files --others --exclude-standard', { cwd: directory, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const out = execSync('git rev-parse --is-inside-work-tree', {
+      cwd: directory,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      maxBuffer: GIT_MAX_BUFFER,
+    });
+    return out.trim() === 'true' ? 'ok' : 'no-repo';
+  } catch (err) {
+    // ENOENT (binary absent) or shell "command not found" (exit 127) → no git.
+    const code = (err as NodeJS.ErrnoException & { status?: number }).code;
+    const status = (err as { status?: number }).status;
+    if (code === 'ENOENT' || status === 127) return 'no-git';
+    // Ran but exited non-zero (e.g. "not a git repository").
+    return 'no-repo';
+  }
+}
+
+export async function getGitChanges(directory: string, state?: PairState): Promise<ModifiedFile[]> {
+  // Determine and record git availability before scanning so the UI can warn
+  // when change tracking is disabled. On any non-'ok' status we still return []
+  // so callers stay unchanged.
+  const gitStatus = probeGitStatus(directory);
+  if (state) state.gitStatus = gitStatus;
+  if (gitStatus !== 'ok') return [];
+
+  try {
+    // core.quotePath=false keeps non-ASCII paths verbatim instead of C-quoted
+    // octal escapes (e.g. "\303\251" for "é").
+    const tracked = execSync('git -c core.quotePath=false diff --name-status HEAD', { cwd: directory, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: GIT_MAX_BUFFER });
+    const untracked = execSync('git -c core.quotePath=false ls-files --others --exclude-standard', { cwd: directory, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: GIT_MAX_BUFFER });
 
     const files: ModifiedFile[] = tracked.trim().split('\n').filter(Boolean).map(line => {
       const parts = line.split('\t');

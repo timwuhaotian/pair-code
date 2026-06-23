@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.0] - 2026-06-22
 
 ### Added
-- Rebuilt engine on the Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) — both agents now run in-process via `query()`, no shell-out to external CLIs.
+- Rebuilt engine on the Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) — both agents are now driven through `query()`, which runs the agent runtime as a managed subprocess (the SDK pulls a platform-specific native binary and the agent inherits the process environment).
 - Ink (React for CLIs) terminal UI with live streaming, agent bars, verdict chips, and slash commands.
 - Per-role endpoint configuration: Mentor and Executor can use different Anthropic-compatible providers.
 - Endpoint profiles via environment variables (`PAIR_PROFILE_<NAME>_BASE_URL` / `_KEY` / `_MODEL`).

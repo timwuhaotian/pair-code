@@ -5,6 +5,7 @@ import type { PairState, Message, Profile } from './types.js';
 import { loadProfiles, suggestModels, profileLabel, addEndpoint, forgetProfile, persistedProfiles } from './providers.js';
 import { configPath } from './config.js';
 import { createPairState, addMessage, initializeGreetingState } from './state.js';
+import { killActiveTurn } from './process.js';
 import { useEngine } from './useEngine.js';
 import { Select, SearchSelect, TextPrompt, SlashInput, type SlashCommand, type SearchItem } from './inputs.js';
 import { Banner, StatusBar, AgentBar, LiveTurn, MessageView, ResultPanel, ConnectorLine, liveSubtitle } from './components.js';
@@ -40,15 +41,29 @@ function EndpointForm(props: {
 }): JSX.Element {
   const [baseUrl, setBaseUrl] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState<string | null>(null);
+  const [urlError, setUrlError] = useState<string | null>(null);
+
+  // Catch a malformed base URL here rather than letting it surface much later as
+  // an opaque network error (and the derived profile name fall back to 'custom').
+  const submitBaseUrl = (v: string) => {
+    let parsed: URL;
+    try { parsed = new URL(v); } catch { setUrlError('Enter a valid URL, e.g. https://api.example.com/anthropic'); return; }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') { setUrlError('URL must start with http:// or https://'); return; }
+    setUrlError(null);
+    setBaseUrl(v);
+  };
 
   if (baseUrl === null) {
     return (
-      <TextPrompt
-        message="Endpoint base URL"
-        placeholder="https://open.bigmodel.cn/api/anthropic"
-        onSubmit={(v) => setBaseUrl(v)}
-        onCancel={props.onCancel}
-      />
+      <Box flexDirection="column">
+        {urlError ? <Text color={colors.error}>  {urlError}</Text> : null}
+        <TextPrompt
+          message="Endpoint base URL"
+          placeholder="https://open.bigmodel.cn/api/anthropic"
+          onSubmit={submitBaseUrl}
+          onCancel={props.onCancel}
+        />
+      </Box>
     );
   }
   if (apiKey === null) {
@@ -211,6 +226,7 @@ function SetupWizard(props: {
         <RolePicker
           roleLabel="Mentor" roleSubtitle="planner & reviewer"
           profiles={profiles} defaultProfileIndex={0}
+          onCancel={() => { mentorRef.current = null; setStep('spec'); }}
           onDone={(pick) => { mentorRef.current = pick; setStep('executor'); }}
         />
       </Box>
@@ -376,6 +392,10 @@ function Session(props: { initialState: PairState }): JSX.Element {
     void engine.runTask(props.initialState);
   }, [engine, props.initialState]);
 
+  // On unmount (including Ink's Ctrl+C exit) interrupt any in-flight SDK query
+  // so we never orphan a paid agent subprocess.
+  useEffect(() => () => killActiveTurn(), []);
+
   // Append new messages into the monotonic transcript (survives task resets).
   useEffect(() => {
     const fresh = state.messages.filter(m => !seen.current.has(m.id));
@@ -403,7 +423,7 @@ function Session(props: { initialState: PairState }): JSX.Element {
     const [cmd, ...rest] = line.slice(1).split(/\s+/);
     const arg = rest.join(' ').trim();
     switch (cmd) {
-      case 'quit': case 'exit': exit(); break;
+      case 'quit': case 'exit': engine.requestStop(); killActiveTurn(); exit(); break;
       case 'config': setOverlay('config'); break;
       case 'mentor': setOverlay('mentor'); break;
       case 'runner': setOverlay('runner'); break;

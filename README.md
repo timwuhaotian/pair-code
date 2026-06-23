@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icon.svg" width="128" height="128" alt="Pair Code icon" />
+  <img src="https://raw.githubusercontent.com/timwuhaotian/pair-cli/main/assets/icon.svg" width="128" height="128" alt="Pair Code icon" />
 </p>
 
 <h1 align="center">Pair Code</h1>
@@ -49,6 +49,8 @@ pair-code ~/projects/api "Add rate limiting middleware"
 pair-code providers
 ```
 
+The CLI is installed as both `pair-code` and the shorter `pair` — the two are interchangeable.
+
 ## How It Works
 
 ```
@@ -66,7 +68,7 @@ pair-code providers
 3. **Mentor** reviews the changes — it can read files but **cannot mutate anything** (enforced by the SDK: `allowedTools: ['Read','Grep','Glob']`, everything else disallowed).
 4. They loop until the Mentor emits `TASK_COMPLETE`, or the iteration budget (default: unlimited, configurable) is hit.
 
-Both roles are driven **in-process** through the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript) — no shell-out to external CLIs. Each role can bind to a **different endpoint**, so you can mix providers (e.g. DeepSeek as Mentor, Kimi as Executor).
+Both roles are orchestrated through the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript), which runs the agent runtime as a managed subprocess (the SDK pulls a platform-specific native binary via `optionalDependencies`, and that subprocess inherits the process environment). Each role can bind to a **different endpoint**, so you can mix providers (e.g. DeepSeek as Mentor, Kimi as Executor).
 
 ## Supported Providers
 
@@ -94,7 +96,7 @@ PAIR_PROFILE_<NAME>_KEY        # API key / bearer token
 PAIR_PROFILE_<NAME>_MODEL      # default model id (optional)
 ```
 
-Plus the implicit official endpoint via `ANTHROPIC_API_KEY` (+ optional `ANTHROPIC_BASE_URL`).
+Plus the implicit official endpoint via `ANTHROPIC_API_KEY` (+ optional `ANTHROPIC_BASE_URL`, and `ANTHROPIC_MODEL` to set its default model).
 
 ### Interactive (session-only or saved)
 
@@ -126,6 +128,7 @@ Then select DeepSeek for the Mentor and Kimi for the Executor in the setup wizar
 | Command | Description |
 |---------|-------------|
 | `/task` | Start a new task with the current agents |
+| `/hello` | Connectivity smoke-test — runs a short Mentor/Executor exchange (consumes tokens) |
 | `/resume` | Continue a paused session |
 | `/config` | Configure endpoints, models & saved credentials |
 | `/mentor` | Re-select mentor profile & model |
@@ -188,6 +191,19 @@ please review our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Security
 
+> [!WARNING]
+> The **Executor is an unsandboxed coding agent.** It runs with full tools
+> (`bypassPermissions`) and can execute arbitrary shell commands, read and write
+> files, and make network requests. Its subprocess inherits your shell
+> environment, so **any secret you have exported is reachable by it** and could
+> be sent to the configured endpoint — which may be a third-party provider. Run
+> `pair-code` in a clean environment, container, or dedicated working directory
+> with only a dedicated API key exported.
+
+Pointing a role at the official Anthropic endpoint (base URL
+`https://api.anthropic.com`) pins `ANTHROPIC_BASE_URL` to that host for the call,
+so an ambient `ANTHROPIC_BASE_URL` in your shell won't silently redirect the key.
+
 API keys are kept in process memory unless you explicitly opt in to saving them
 (`0600`, owner-only). To report a vulnerability, see [SECURITY.md](SECURITY.md) —
 please don't open a public issue for security reports.
@@ -198,7 +214,7 @@ please don't open a public issue for security reports.
 
 ## Acknowledgements
 
-- [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript) — in-process agent orchestration
+- [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript) — managed-subprocess agent orchestration
 - [Ink](https://github.com/vadimdemedes/ink) — React for CLIs
 - [React 19](https://react.dev/) — UI runtime
 

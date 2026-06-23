@@ -78,5 +78,8 @@ export function formatIterations(iteration: number, max: number): string {
 
 export function truncate(str: string, maxLen: number): string {
   if (str.length <= maxLen) return str;
-  return str.slice(0, Math.max(1, maxLen - 1)) + icons.ellipsis;
+  // maxLen <= 1 leaves no room for "<char>…", so bound the ellipsis itself to
+  // maxLen rather than overflowing to maxLen+1 glyphs.
+  if (maxLen <= 1) return (maxLen <= 0 ? '' : icons.ellipsis).slice(0, maxLen);
+  return str.slice(0, maxLen - 1) + icons.ellipsis;
 }

@@ -46,15 +46,26 @@ export function registerSessionProfile(input: { baseUrl: string; apiKey: string;
 }
 
 /**
- * Save an endpoint to the on-disk config so it survives across sessions. Re-entry
- * of the same derived name overwrites in place (handy for rotating a key); a
- * clash with an env/session name is suffixed so it never shadows those.
+ * Save an endpoint to the on-disk config so it survives across sessions. Re-saving
+ * the *same endpoint* (matched by baseUrl) overwrites in place — that's how a key
+ * is rotated. We match on baseUrl rather than the derived name because the name
+ * can be suffixed when it clashes with an env/session profile, and a name-only
+ * match would then create a duplicate saved entry instead of rotating the key.
+ * Only when no saved entry shares the baseUrl do we mint a fresh (clash-safe) name.
  */
 export function persistProfile(input: { baseUrl: string; apiKey: string; name?: string; defaultModel?: string }): ResolvedProfile {
   const baseUrl = input.baseUrl.trim();
-  const base = input.name ?? deriveName(baseUrl);
-  const cfg = readConfig();
-  const name = cfg.profiles[base] ? base : uniqueName(base);
+  let cfg: PairConfig;
+  try {
+    cfg = readConfig();
+  } catch (err) {
+    // Don't swallow a corrupt config on a write path: degrading to an empty
+    // config here would overwrite (and destroy) the broken file. Surface a
+    // readable error instead so the caller can tell the user to fix it.
+    throw new Error(err instanceof Error ? err.message : 'failed to read saved config');
+  }
+  const existing = Object.keys(cfg.profiles).find(n => cfg.profiles[n].baseUrl === baseUrl);
+  const name = existing ?? uniqueName(input.name ?? deriveName(baseUrl));
   cfg.profiles[name] = { baseUrl, apiKey: input.apiKey, defaultModel: input.defaultModel };
   writeConfig(cfg);
   return { name, label: humanizeProfileName(name), baseUrl, defaultModel: input.defaultModel, apiKey: input.apiKey };
@@ -71,12 +82,24 @@ export function persistedProfiles(): Profile[] {
 }
 
 export function isProfilePersisted(name: string): boolean {
-  return name in readConfig().profiles;
+  // A corrupt config has no usable saved profiles — treat as not persisted.
+  try {
+    return name in readConfig().profiles;
+  } catch {
+    return false;
+  }
 }
 
 /** Delete a saved profile from disk. Returns false if it wasn't saved. */
 export function forgetProfile(name: string): boolean {
-  const cfg = readConfig();
+  let cfg: PairConfig;
+  try {
+    cfg = readConfig();
+  } catch (err) {
+    // As in persistProfile: never overwrite a corrupt config on a write path.
+    // Surface a readable error so the user can repair the file by hand.
+    throw new Error(err instanceof Error ? err.message : 'failed to read saved config');
+  }
   if (!(name in cfg.profiles)) return false;
   delete cfg.profiles[name];
   writeConfig(cfg);
@@ -152,9 +175,10 @@ export function loadProfiles(): Profile[] {
 
 /**
  * Saved profiles from the on-disk config, secrets stripped. If the config is
- * corrupted, degrade to an empty list rather than crashing — the write path
- * (persistProfile/forgetProfile) still calls readConfig() directly and will
- * throw, preventing an overwrite that destroys the broken file.
+ * corrupted, degrade to an empty list rather than crashing. Read paths
+ * (isProfilePersisted / resolveProfile's saved-key fallback) degrade the same
+ * way, while write paths (persistProfile / forgetProfile) instead surface a
+ * readable error so they never overwrite — and destroy — a broken file.
  */
 function loadPersistedProfiles(): Profile[] {
   let cfg: PairConfig;
@@ -197,7 +221,14 @@ export function resolveProfile(name: string): ResolvedProfile | undefined {
     : findEnvKey(name);
   if (envKey) return { ...base, apiKey: envKey };
 
-  const stored = readConfig().profiles[name];
+  // Saved key fallback. A corrupt config yields no usable key — fall through to
+  // undefined rather than crashing the turn with a raw parse error.
+  let stored: PairConfig['profiles'][string] | undefined;
+  try {
+    stored = readConfig().profiles[name];
+  } catch {
+    stored = undefined;
+  }
   if (stored?.apiKey) return { ...base, apiKey: stored.apiKey };
 
   return undefined;
@@ -214,7 +245,11 @@ export function profileEnv(resolved: ResolvedProfile): Record<string, string> {
     ANTHROPIC_API_KEY: resolved.apiKey,
     ANTHROPIC_AUTH_TOKEN: resolved.apiKey,
   };
-  if (resolved.baseUrl) env.ANTHROPIC_BASE_URL = resolved.baseUrl;
+  // The official 'anthropic' profile has an empty baseUrl by design. Pin it to
+  // the canonical URL explicitly so an ambient exported ANTHROPIC_BASE_URL can't
+  // silently redirect the official key to a third-party endpoint. Third-party
+  // profiles always carry their own baseUrl.
+  env.ANTHROPIC_BASE_URL = resolved.baseUrl || 'https://api.anthropic.com';
   return env;
 }
 
@@ -264,7 +299,16 @@ export function suggestModels(profileName: string, defaultModel?: string): Model
 function humanizeProfileName(raw: string): string {
   const lower = raw.toLowerCase();
   for (const brand in KNOWN_BRANDS) {
-    if (lower.startsWith(brand)) return KNOWN_BRANDS[brand];
+    if (!lower.startsWith(brand)) continue;
+    const rest = lower.slice(brand.length);
+    // Bare brand → just the brand label.
+    if (!rest) return KNOWN_BRANDS[brand];
+    // Brand + separated suffix (e.g. 'anthropic-eu') → keep the suffix so labels
+    // stay unique (e.g. 'Anthropic (eu)'). A run-on like 'anthropicfoo' isn't a
+    // clean brand match, so fall through to default titlecasing instead.
+    const suffix = rest.replace(/^[-_.]+/, '');
+    if (suffix.length < rest.length) return `${KNOWN_BRANDS[brand]} (${suffix})`;
+    break;
   }
   return raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase();
 }

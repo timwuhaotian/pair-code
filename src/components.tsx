@@ -89,9 +89,15 @@ function statusGlyph(status: string): string {
   return icons.dot;
 }
 
+/** Format an accumulated USD cost compactly, e.g. 0.0123 → "$0.0123". */
+function formatUsd(n: number): string {
+  return `$${n.toFixed(4)}`;
+}
+
 export function StatusBar({ state, elapsedMs }: { state: PairState; elapsedMs: number }): JSX.Element {
   const color = STATUS_COLOR[state.status] ?? colors.accent;
   const tok = (state.mentor.tokenUsage?.outputTokens ?? 0) + (state.executor.tokenUsage?.outputTokens ?? 0);
+  const cost = state.totalCostUsd ?? 0;
   return (
     <Box justifyContent="space-between">
       <Text>
@@ -99,6 +105,7 @@ export function StatusBar({ state, elapsedMs }: { state: PairState; elapsedMs: n
         <Text color={color} bold>{state.status.replace(/_/g, ' ').toUpperCase()}</Text>
         <Text dimColor>  iter {formatIterations(state.iteration, state.maxIterations)}  {formatDuration(elapsedMs)}</Text>
         {tok > 0 ? <Text dimColor>  {formatTokens(tok)} tok</Text> : null}
+        {cost > 0 ? <Text dimColor>  {formatUsd(cost)}</Text> : null}
       </Text>
       <Text>
         <Text color={colors.mentor}>{icons.mentor} </Text>
@@ -179,32 +186,86 @@ function senderIcon(from: string): string {
 
 interface Verdict { verdict?: string; risk?: string; confidence?: number; summary?: string }
 
-function parseVerdict(content: string): Verdict | null {
-  const m = content.match(/```json\s*([\s\S]*?)```/i);
-  if (!m) return null;
+/** Strip a single trailing comma before a closing } or ] so near-valid JSON parses. */
+function stripTrailingCommas(s: string): string {
+  return s.replace(/,(\s*[}\]])/g, '$1');
+}
+
+/** Try to parse a candidate JSON string into a verdict, tolerating trailing commas. */
+function toVerdict(raw: string): Verdict | null {
+  let o: Record<string, unknown>;
   try {
-    const o = JSON.parse(m[1]) as Record<string, unknown>;
-    const verdict = typeof o.verdict === 'string' ? o.verdict : undefined;
-    const risk = typeof o.risk === 'string' ? o.risk : undefined;
-    if (!verdict && !risk) return null;
-    return {
-      verdict,
-      risk,
-      confidence: typeof o.confidence === 'number' ? o.confidence : undefined,
-      summary: typeof o.summary === 'string' ? o.summary : undefined,
-    };
-  } catch { return null; }
+    o = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    try {
+      o = JSON.parse(stripTrailingCommas(raw)) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+  if (!o || typeof o !== 'object') return null;
+  const verdict = typeof o.verdict === 'string' ? o.verdict.toLowerCase() : undefined;
+  const risk = typeof o.risk === 'string' ? o.risk.toLowerCase() : undefined;
+  if (!verdict && !risk) return null;
+  return {
+    verdict,
+    risk,
+    confidence: typeof o.confidence === 'number' ? o.confidence : undefined,
+    summary: typeof o.summary === 'string' ? o.summary : undefined,
+  };
+}
+
+/**
+ * Extract the verdict block from a mentor review. Scans every fenced code block
+ * (```json, a bare ``` fence, or any language tag) and returns the first one
+ * that parses into an object carrying a `verdict` or `risk` field — a leading
+ * non-verdict json block no longer suppresses the chip. Falls back to
+ * brace-matching the first {…} that parses when no fence yields a verdict.
+ */
+function parseVerdict(content: string): Verdict | null {
+  for (const m of content.matchAll(/```[^\n]*\n([\s\S]*?)```/g)) {
+    const v = toVerdict(m[1].trim());
+    if (v) return v;
+  }
+  // No fenced verdict — try each top-level {…} span in document order.
+  for (const m of content.matchAll(/\{[\s\S]*?\}/g)) {
+    const v = toVerdict(m[0]);
+    if (v) return v;
+  }
+  return null;
+}
+
+/**
+ * Remove every verdict-bearing block from the rendered body so the raw JSON
+ * never leaks beside the chip. Globally strips any fenced block (tagged, bare,
+ * or ```json) whose payload parses to a verdict, then any remaining {…} span
+ * that does — mirroring what `parseVerdict` consumes. Non-verdict code fences
+ * are left untouched.
+ */
+function stripVerdictBlocks(content: string): string {
+  return content
+    .replace(/```[^\n]*\n[\s\S]*?```/g, block => {
+      const inner = block.replace(/^```[^\n]*\n/, '').replace(/```$/, '');
+      return toVerdict(inner.trim()) ? '' : block;
+    })
+    .replace(/\{[\s\S]*?\}/g, span => (toVerdict(span) ? '' : span))
+    .trim();
 }
 
 function VerdictChip({ v }: { v: Verdict }): JSX.Element {
   const pass = (v.verdict ?? '').toLowerCase() === 'pass';
   const chipColor = pass ? colors.success : colors.error;
-  const riskColor = v.risk === 'high' ? colors.error : v.risk === 'medium' ? colors.warn : colors.success;
+  const risk = (v.risk ?? '').toLowerCase();
+  const riskColor = risk === 'high' ? colors.error : risk === 'medium' ? colors.warn : colors.success;
+  // Confidence may arrive as 0..1 or as an already-scaled 0..100 percentage.
+  const confPct = typeof v.confidence === 'number'
+    ? Math.round(Math.max(0, Math.min(100, v.confidence > 1 ? v.confidence : v.confidence * 100)))
+    : null;
   return (
     <Text>
       <Text backgroundColor={chipColor} color="black" bold> {pass ? icons.check : icons.cross} {(v.verdict ?? '?').toUpperCase()} </Text>
       {v.risk ? <Text> <Text dimColor>risk</Text> <Text color={riskColor}>{v.risk}</Text></Text> : null}
-      {typeof v.confidence === 'number' ? <Text dimColor> · {Math.round(v.confidence * 100)}% conf</Text> : null}
+      {confPct !== null ? <Text dimColor> · {confPct}% conf</Text> : null}
     </Text>
   );
 }
@@ -212,7 +273,7 @@ function VerdictChip({ v }: { v: Verdict }): JSX.Element {
 export function MessageView({ msg, maxLines = 120 }: { msg: Message; maxLines?: number }): JSX.Element {
   const color = senderColor(msg.from);
   const verdict = msg.type === 'acceptance' ? parseVerdict(msg.content) : null;
-  const bodyText = (verdict ? msg.content.replace(/```json[\s\S]*?```/gi, '').trim() : msg.content) || (verdict?.summary ?? '');
+  const bodyText = (verdict ? stripVerdictBlocks(msg.content) : msg.content) || (verdict?.summary ?? '');
   const lines = bodyText.split('\n');
   const shown = lines.length > maxLines ? lines.slice(0, maxLines) : lines;
   const clipped = lines.length - shown.length;
@@ -293,6 +354,13 @@ function plural(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? '' : 's'}`;
 }
 
+/** Why change tracking is disabled, or null when git is healthy. */
+function gitDisabledReason(gitStatus: PairState['gitStatus']): string | null {
+  if (gitStatus === 'no-repo') return 'change tracking disabled: not a git repo';
+  if (gitStatus === 'no-git') return 'change tracking disabled: git not found';
+  return null;
+}
+
 export function ResultPanel({ state }: { state: PairState }): JSX.Element {
   if (state.status === 'finished') {
     const dur = state.finishedAt && state.createdAt ? formatDuration(state.finishedAt - state.createdAt) : '—';
@@ -308,6 +376,8 @@ export function ResultPanel({ state }: { state: PairState }): JSX.Element {
               <Text key={i}><Text color={colors.success}>{f.status}</Text>  {f.path}</Text>
             ))}
           </Box>
+        ) : gitDisabledReason(state.gitStatus) ? (
+          <Text dimColor>{gitDisabledReason(state.gitStatus)}</Text>
         ) : null}
         <Text dimColor>Type a new task, or /quit to exit.</Text>
       </Box>

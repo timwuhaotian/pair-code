@@ -33,7 +33,10 @@ let activeQuery: Query | null = null;
 
 export function killActiveTurn(): void {
   if (activeQuery) {
-    try { void activeQuery.interrupt(); } catch { /* ignore */ }
+    // The AbortController.abort() in runTurn is the real interrupt mechanism;
+    // interrupt() is best-effort. Chain a .catch so a rejected interrupt() can't
+    // escape as an unhandled rejection (a sync throw is caught by the try too).
+    try { void Promise.resolve(activeQuery.interrupt()).catch(() => {}); } catch { /* ignore */ }
   }
 }
 
@@ -95,7 +98,9 @@ export async function runTurn(
   let tokenUsage: TokenUsage | undefined;
   let firstToken = true;
 
+  let timedOut = false;
   const timer = setTimeout(() => {
+    timedOut = true;
     controller.abort();
     killActiveTurn();
   }, TURN_TIMEOUT_MS);
@@ -165,7 +170,10 @@ export async function runTurn(
   }
 
   if (controller.signal.aborted && !finalText) {
-    throw new Error(`${role} turn aborted`);
+    // A timeout-driven abort and a user-stop abort look identical on the
+    // signal; the timedOut flag lets us surface the real cause so the error
+    // panel doesn't show a misleading "/model" hint for a 10-minute timeout.
+    throw new Error(timedOut ? `${role} turn timed out after 10 minutes` : `${role} turn aborted`);
   }
 
   return {
@@ -285,10 +293,12 @@ function createEngineLoop(initial: PairState, callbacks: EngineCallbacks): Engin
 
 /** Apply a turn's sessionId + tokenUsage back into the runtime for the given role. */
 function applyTurnResult(state: PairState, role: 'mentor' | 'executor', result: TurnResult): PairState {
-  if (!result.sessionId) return state;
+  // Accumulate spend on every turn (including greeting turns) regardless of whether a sessionId came back.
+  const withCost: PairState = { ...state, totalCostUsd: state.totalCostUsd + (result.tokenUsage?.costUsd ?? 0) };
+  if (!result.sessionId) return withCost;
   return role === 'mentor'
-    ? { ...state, mentor: { ...state.mentor, sessionId: result.sessionId, tokenUsage: result.tokenUsage } }
-    : { ...state, executor: { ...state.executor, sessionId: result.sessionId, tokenUsage: result.tokenUsage } };
+    ? { ...withCost, mentor: { ...withCost.mentor, sessionId: result.sessionId, tokenUsage: result.tokenUsage } }
+    : { ...withCost, executor: { ...withCost.executor, sessionId: result.sessionId, tokenUsage: result.tokenUsage } };
 }
 
 export async function runPairEngine(
@@ -299,12 +309,32 @@ export async function runPairEngine(
   const { update, turnCallbacks, checkStop } = loop;
   const { onLog, onMessage, onError } = callbacks;
 
-  const isResumption = !!loop.state.mentor.sessionId && loop.state.iteration > 0;
+  // Derive resumption from progress, not from a sessionId: a mentor-endpoint
+  // change clears mentor.sessionId, but the run still has prior iterations and
+  // messages, so it must NOT be re-planned from scratch. The sessionId is only
+  // used to pass resume:<sessionId> at turn time (and only when present).
+  const isResumption = loop.state.iteration > 0 || loop.state.messages.length > 0;
   if (!isResumption) loop.state = { ...loop.state, turn: 'mentor' };
+
+  // Resuming from a finite max-iterations pause would otherwise run one
+  // unreviewed executor turn and immediately re-pause without advancing. Raise
+  // the effective cap by one full round so a resume guarantees at least one
+  // executor→mentor round-trip. The default Infinity is unaffected.
+  if (isResumption && Number.isFinite(loop.state.maxIterations) && loop.state.iteration >= loop.state.maxIterations) {
+    loop.state = { ...loop.state, maxIterations: loop.state.iteration + 1 };
+  }
 
   try {
     let latestPlan: string;
     const spec = getTaskSpec(loop.state);
+
+    // No-progress guard: an executor that produces no usable text (empty turns
+    // substitute EMPTY_OUTPUT) — or repeats the prior turn verbatim — would
+    // otherwise spin until maxIterations (default Infinity). Bail after this
+    // many consecutive empty/identical executor outputs.
+    const MAX_NO_PROGRESS_TURNS = 3;
+    let noProgressTurns = 0;
+    let prevExecutorOutput: string | undefined;
 
     if (!isResumption) {
       loop.state = prepareRun(loop.state, 'mentor');
@@ -344,13 +374,17 @@ export async function runPairEngine(
       update(loop.state);
       onMessage(loop.state);
 
-      const changes = await getGitChanges(loop.state.directory);
+      const changes = await getGitChanges(loop.state.directory, loop.state);
       if (changes.length > 0) { loop.state = { ...loop.state, modifiedFiles: changes }; update(loop.state); }
 
-      // Only fires when a finite cap was set explicitly; the default is
-      // Infinity (unlimited), so the loop runs until the mentor finishes.
-      if (Number.isFinite(loop.state.maxIterations) && loop.state.iteration >= loop.state.maxIterations) {
-        loop.state = setPairStatus(loop.state, 'paused', `Max iterations reached (${loop.state.maxIterations})`);
+      // No-progress guard: count consecutive executor turns that produced no
+      // usable output (empty / EMPTY_OUTPUT) or repeated the prior turn verbatim.
+      const trimmedOutput = executorResult.output.trim();
+      const noProgress = trimmedOutput === '' || trimmedOutput === EMPTY_OUTPUT || trimmedOutput === prevExecutorOutput;
+      noProgressTurns = noProgress ? noProgressTurns + 1 : 0;
+      prevExecutorOutput = trimmedOutput;
+      if (noProgressTurns >= MAX_NO_PROGRESS_TURNS) {
+        loop.state = setPairStatus(loop.state, 'error', `No progress: ${noProgressTurns} consecutive empty/identical turns`);
         update(loop.state);
         break;
       }
@@ -373,6 +407,16 @@ export async function runPairEngine(
 
       if (mentorWantsFinish) {
         loop.state = setPairStatus(loop.state, 'finished', 'Mentor signaled task complete');
+        update(loop.state);
+        break;
+      }
+
+      // Finite-cap check, AFTER the mentor review so a finite cap ends on a
+      // completed, reviewed round rather than on unreviewed executor work.
+      // Only fires when a finite cap was set explicitly; the default is
+      // Infinity (unlimited), so the loop runs until the mentor finishes.
+      if (Number.isFinite(loop.state.maxIterations) && loop.state.iteration >= loop.state.maxIterations) {
+        loop.state = setPairStatus(loop.state, 'paused', `Max iterations reached (${loop.state.maxIterations})`);
         update(loop.state);
         break;
       }

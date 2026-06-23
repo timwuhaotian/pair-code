@@ -23,6 +23,20 @@ export interface PairConfig {
 
 const CONFIG_VERSION = 1;
 
+/**
+ * Thrown when the config file exists but its contents aren't valid JSON. Carries
+ * the offending path so callers can render a readable "config is corrupt at
+ * <path>" message instead of crashing on a raw SyntaxError.
+ */
+export class CorruptConfigError extends Error {
+  readonly path: string;
+  constructor(path: string, cause: unknown) {
+    super(`config is corrupt at ${path}`, { cause });
+    this.name = 'CorruptConfigError';
+    this.path = path;
+  }
+}
+
 /** Config directory, honouring XDG_CONFIG_HOME, else ~/.config/pair-code. */
 export function configDir(): string {
   const xdg = process.env.XDG_CONFIG_HOME?.trim();
@@ -35,18 +49,24 @@ export function configPath(): string {
 
 /**
  * Read the saved config. Returns an empty config only when the file doesn't
- * exist (first run). If the file exists but is corrupted, the error propagates
- * — catching it here would cause the next writeConfig() to silently overwrite
- * the broken file and destroy all saved credentials.
+ * exist (first run). If the file exists but is corrupted, a CorruptConfigError
+ * propagates — catching it here would cause the next writeConfig() to silently
+ * overwrite the broken file and destroy all saved credentials. Callers decide
+ * how to surface it (it carries the offending path for a readable message).
  */
 export function readConfig(): PairConfig {
   const path = configPath();
   if (!existsSync(path)) return { version: CONFIG_VERSION, profiles: {} };
 
-  const parsed = JSON.parse(readFileSync(path, 'utf-8')) as Partial<PairConfig>;
+  let parsed: Partial<PairConfig>;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf-8')) as Partial<PairConfig>;
+  } catch (err) {
+    throw new CorruptConfigError(path, err);
+  }
   return {
     version: typeof parsed.version === 'number' ? parsed.version : CONFIG_VERSION,
-    profiles: isRecord(parsed.profiles) ? (parsed.profiles as Record<string, StoredProfile>) : {},
+    profiles: sanitiseProfiles(parsed.profiles),
   };
 }
 
@@ -56,7 +76,15 @@ export function readConfig(): PairConfig {
  * containing dir at 0700 so the key is owner-only.
  */
 export function writeConfig(config: PairConfig): void {
-  mkdirSync(configDir(), { recursive: true, mode: 0o700 });
+  const dir = configDir();
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // mkdir's mode is ignored when the dir already exists, so re-tighten it
+  // unconditionally; tolerate non-POSIX filesystems that lack chmod semantics.
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    /* best-effort: not all filesystems honour POSIX perms */
+  }
   const path = configPath();
   const tmp = `${path}.tmp-${process.pid}`;
   const data = JSON.stringify({ ...config, version: CONFIG_VERSION }, null, 2);
@@ -67,4 +95,27 @@ export function writeConfig(config: PairConfig): void {
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Keep only entries that describe a runnable saved endpoint: an object with a
+ * non-empty string apiKey and a string baseUrl. Malformed entries (non-object,
+ * or missing fields) are dropped so they can't surface as ghost profiles in the
+ * picker.
+ */
+function sanitiseProfiles(raw: unknown): Record<string, StoredProfile> {
+  if (!isRecord(raw)) return {};
+  const out: Record<string, StoredProfile> = {};
+  for (const [name, value] of Object.entries(raw)) {
+    if (!isRecord(value)) continue;
+    const { apiKey, baseUrl, defaultModel } = value;
+    if (typeof apiKey !== 'string' || apiKey.length === 0) continue;
+    if (typeof baseUrl !== 'string') continue;
+    out[name] = {
+      baseUrl,
+      apiKey,
+      ...(typeof defaultModel === 'string' ? { defaultModel } : {}),
+    };
+  }
+  return out;
 }
