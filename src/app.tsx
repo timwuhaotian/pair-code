@@ -1,11 +1,9 @@
-import { useEffect, useRef, useState, type ReactNode, type JSX } from 'react';
-import { execSync } from 'node:child_process';
+import { useEffect, useRef, useState, useMemo, type ReactNode, type JSX } from 'react';
 import { Box, Text, Static, useApp, useInput, useStdout } from 'ink';
 import type { PairState, Message, Profile } from './types.js';
 import { loadProfiles, suggestModels, profileLabel, addEndpoint, forgetProfile, persistedProfiles } from './providers.js';
 import { configPath } from './config.js';
-import { createPairState, addMessage, initializeGreetingState } from './state.js';
-import { killActiveTurn } from './process.js';
+import { createPairState, addMessage, freshTask, freshGreeting, getGitDiffStat } from './state.js';
 import { useEngine } from './useEngine.js';
 import { Select, SearchSelect, TextPrompt, SlashInput, type SlashCommand, type SearchItem } from './inputs.js';
 import { Banner, StatusBar, AgentBar, LiveTurn, MessageView, ResultPanel, ConnectorLine, liveSubtitle } from './components.js';
@@ -47,6 +45,7 @@ function EndpointForm(props: {
   const [baseUrl, setBaseUrl] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState<string | null>(null);
   const [urlError, setUrlError] = useState<string | null>(null);
+  const [httpWarn, setHttpWarn] = useState<string | null>(null);
 
   // Catch a malformed base URL here rather than letting it surface much later as
   // an opaque network error (and the derived profile name fall back to 'custom').
@@ -54,9 +53,31 @@ function EndpointForm(props: {
     let parsed: URL;
     try { parsed = new URL(v); } catch { setUrlError('Enter a valid URL, e.g. https://api.example.com/anthropic'); return; }
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') { setUrlError('URL must start with http:// or https://'); return; }
+    if (parsed.protocol === 'http:' && parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1') {
+      setHttpWarn(v);
+      return;
+    }
     setUrlError(null);
+    setHttpWarn(null);
     setBaseUrl(v);
   };
+
+  if (httpWarn) {
+    return (
+      <Box flexDirection="column">
+        <Text color={colors.error}>  ⚠ HTTP sends your API key unencrypted to {httpWarn}</Text>
+        <Select
+          message="Continue with unencrypted HTTP?"
+          items={[
+            { label: 'No — let me re-enter the URL', value: 'no' },
+            { label: 'Yes — I understand the risk', value: 'yes' },
+          ]}
+          onSubmit={(choice) => { const url = httpWarn; setHttpWarn(null); if (choice === 'yes') setBaseUrl(url); }}
+          onCancel={() => setHttpWarn(null)}
+        />
+      </Box>
+    );
+  }
 
   if (baseUrl === null) {
     return (
@@ -115,6 +136,7 @@ function RolePicker(props: {
   highlightSameAs?: boolean;
   onDone: (pick: RolePick) => void;
   onCancel?: () => void;
+  onProfilesChanged?: () => void;
 }): JSX.Element {
   const [chosen, setChosen] = useState<Profile | null>(null);
   const [adding, setAdding] = useState(false);
@@ -126,7 +148,7 @@ function RolePicker(props: {
         <Text dimColor>  Add an Anthropic-compatible endpoint (this session only)</Text>
         <EndpointForm
           onCancel={() => setAdding(false)}
-          onDone={({ baseUrl, apiKey, remember }) => { const r = addEndpoint({ baseUrl, apiKey, remember }); setAdding(false); setChosen(r); }}
+          onDone={({ baseUrl, apiKey, remember }) => { const r = addEndpoint({ baseUrl, apiKey, remember }); props.onProfilesChanged?.(); setAdding(false); setChosen(r); }}
         />
       </Box>
     );
@@ -204,7 +226,8 @@ function SetupWizard(props: {
   const [notice, setNotice] = useState<ReactNode | null>(null);
   // Read fresh each render so an endpoint added via "+ Add" during one role's
   // pick is immediately available to the other role.
-  const profiles = loadProfiles();
+  const [profileTick, setProfileTick] = useState(0);
+  const profiles = useMemo(() => loadProfiles(), [profileTick]);
 
   const mentorHint = mentorPick ? `${profileLabel(mentorPick.profileName)} / ${mentorPick.model}` : 'not set';
   const executorHint = executorPick ? `${profileLabel(executorPick.profileName)} / ${executorPick.model}` : 'not set';
@@ -277,7 +300,7 @@ function SetupWizard(props: {
   }
 
   if (overlay === 'creds') {
-    return <CredsManager onBack={() => setOverlay('config')} onNotice={setNotice} />;
+    return <CredsManager onBack={() => setOverlay('config')} onNotice={setNotice} onProfilesChanged={() => setProfileTick(t => t + 1)} />;
   }
 
   if (overlay === 'mentor' || overlay === 'runner') {
@@ -294,6 +317,7 @@ function SetupWizard(props: {
             : null}
           onCancel={() => setOverlay(null)}
           onDone={(pick) => setRoleFromOverlay(role, pick)}
+          onProfilesChanged={() => setProfileTick(t => t + 1)}
         />
       </Box>
     );
@@ -319,6 +343,7 @@ function SetupWizard(props: {
           profiles={profiles} defaultProfileIndex={0}
           onCancel={() => setStep('spec')}
           onDone={(pick) => { setMentorPick(pick); setStep('executor'); }}
+          onProfilesChanged={() => setProfileTick(t => t + 1)}
         />
       </Box>
     );
@@ -338,6 +363,7 @@ function SetupWizard(props: {
           if (mentorPick && spec.trim()) complete(spec.trim(), mentorPick, pick);
           else setStep('spec');
         }}
+        onProfilesChanged={() => setProfileTick(t => t + 1)}
       />
     </Box>
   );
@@ -371,7 +397,7 @@ function ConfigMenu(props: {
 }
 
 /** List saved endpoints and let the user delete one (the key) from disk. */
-function CredsManager(props: { onBack: () => void; onNotice: (n: ReactNode) => void }): JSX.Element {
+function CredsManager(props: { onBack: () => void; onNotice: (n: ReactNode) => void; onProfilesChanged?: () => void }): JSX.Element {
   const [tick, setTick] = useState(0);
   const [pending, setPending] = useState<string | null>(null);
   const saved = persistedProfiles(); // re-read on each render; `tick` forces it after a delete
@@ -398,7 +424,7 @@ function CredsManager(props: { onBack: () => void; onNotice: (n: ReactNode) => v
             { label: 'Yes, delete the key from disk', value: 'yes' },
           ]}
           onSubmit={(v) => {
-            if (v === 'yes') { forgetProfile(pending); props.onNotice(<Text dimColor>{icons.check} removed saved credentials for {label}</Text>); }
+            if (v === 'yes') { forgetProfile(pending); props.onProfilesChanged?.(); props.onNotice(<Text dimColor>{icons.check} removed saved credentials for {label}</Text>); }
             setPending(null);
             setTick(t => t + 1);
           }}
@@ -425,50 +451,21 @@ function CredsManager(props: { onBack: () => void; onNotice: (n: ReactNode) => v
 
 // ── Session ──────────────────────────────────────────────────────────────
 
-function freshTask(prev: PairState, spec: string): PairState {
-  let s = createPairState({
-    directory: prev.directory,
-    spec,
-    mentor: { role: 'mentor', profileName: prev.mentor.profileName, baseUrl: prev.mentor.baseUrl, model: prev.mentor.model },
-    executor: { role: 'executor', profileName: prev.executor.profileName, baseUrl: prev.executor.baseUrl, model: prev.executor.model },
-    maxIterations: prev.maxIterations,
-  });
-  s = addMessage(s, { from: 'human', to: 'mentor', type: 'feedback', content: spec });
-  return s;
-}
-
-// A from-scratch greeting smoke-test: keep the configured endpoints/models but
-// drop prior sessionIds so each role starts a clean session, reset iteration,
-// and seed greetingState. No task spec, no messages, no modified files.
-function freshGreeting(prev: PairState): PairState {
-  return {
-    ...createPairState({
-      directory: prev.directory,
-      spec: '',
-      mentor: { role: 'mentor', profileName: prev.mentor.profileName, baseUrl: prev.mentor.baseUrl, model: prev.mentor.model },
-      executor: { role: 'executor', profileName: prev.executor.profileName, baseUrl: prev.executor.baseUrl, model: prev.executor.model },
-      maxIterations: prev.maxIterations,
-    }),
-    status: 'greeting',
-    turn: 'mentor',
-    greetingState: initializeGreetingState(),
-  };
-}
-
 function Session(props: { initialState: PairState }): JSX.Element {
   const { exit } = useApp();
   const { write } = useStdout();
   const engine = useEngine(props.initialState);
   const state = engine.state ?? props.initialState;
-  // Recomputed each render so endpoints added mid-session (via an overlay's
-  // "+ Add endpoint") appear immediately; loadProfiles() is a cheap env scan.
-  const profiles = loadProfiles();
+  const [profileTick, setProfileTick] = useState(0);
+  const profiles = useMemo(() => loadProfiles(), [profileTick]);
 
   const [overlay, setOverlay] = useState<null | 'mentor' | 'runner' | 'config' | 'creds'>(null);
   const [notice, setNotice] = useState<ReactNode | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [transcript, setTranscript] = useState<Message[]>([]);
-  const seen = useRef(new Set<string>());
+  const [stopping, setStopping] = useState(false);
+  const [clearTick, setClearTick] = useState(0);
+  const lastMsgCount = useRef(0);
   const started = useRef(false);
 
   // Auto-run the first task once.
@@ -480,13 +477,17 @@ function Session(props: { initialState: PairState }): JSX.Element {
 
   // On unmount (including Ink's Ctrl+C exit) interrupt any in-flight SDK query
   // so we never orphan a paid agent subprocess.
-  useEffect(() => () => killActiveTurn(), []);
+  useEffect(() => () => engine.requestStop(), [engine]);
 
   // Append new messages into the monotonic transcript (survives task resets).
+  // Index-based: O(1) instead of O(n) filter on every state change.
   useEffect(() => {
-    const fresh = state.messages.filter(m => !seen.current.has(m.id));
-    if (fresh.length === 0) return;
-    fresh.forEach(m => seen.current.add(m.id));
+    const total = state.messages.length;
+    // If messages array shrank (e.g. new task via freshTask), reset counter.
+    if (total < lastMsgCount.current) lastMsgCount.current = 0;
+    if (total <= lastMsgCount.current) return;
+    const fresh = state.messages.slice(lastMsgCount.current);
+    lastMsgCount.current = total;
     setTranscript(prev => [...prev, ...fresh]);
   }, [state.messages]);
 
@@ -497,8 +498,11 @@ function Session(props: { initialState: PairState }): JSX.Element {
     return () => clearInterval(t);
   }, [engine.running, state.createdAt]);
 
+  // Clear stopping feedback once the turn finishes.
+  useEffect(() => { if (!engine.running) setStopping(false); }, [engine.running]);
+
   // Esc to stop a running turn.
-  useInput((_i, key) => { if (key.escape) engine.requestStop(); }, { isActive: engine.running && !overlay });
+  useInput((_i, key) => { if (key.escape) { engine.requestStop(); setStopping(true); } }, { isActive: engine.running && !overlay });
 
   const runReplace = async (next: PairState) => { engine.setState(next); await engine.runTask(next); };
   const runGreeting = async (next: PairState) => { engine.setState(next); await engine.runGreeting(next); };
@@ -507,9 +511,10 @@ function Session(props: { initialState: PairState }): JSX.Element {
     setNotice(null);
     if (!line.startsWith('/')) { void runReplace(freshTask(state, line)); return; }
     const [cmd, ...rest] = line.slice(1).split(/\s+/);
+    if (!cmd) { setNotice(<Text dimColor>Type a command after / — try /help</Text>); return; }
     const arg = rest.join(' ').trim();
     switch (cmd) {
-      case 'quit': case 'exit': engine.requestStop(); killActiveTurn(); exit(); break;
+      case 'quit': case 'exit': engine.requestStop(); exit(); break;
       case 'config': setOverlay('config'); break;
       case 'mentor': setOverlay('mentor'); break;
       case 'executor': case 'runner': setOverlay('runner'); break;
@@ -519,7 +524,7 @@ function Session(props: { initialState: PairState }): JSX.Element {
         else void runGreeting(freshGreeting(state));
         break;
       case 'resume': {
-        if (state.status !== 'paused') { setNotice(<Text dimColor>Nothing to resume — session is {state.status}.</Text>); break; }
+        if (state.status !== 'paused' && state.status !== 'error') { setNotice(<Text dimColor>Nothing to resume — session is {state.status}.</Text>); break; }
         const next = { ...state, status: 'mentoring' as const };
         engine.setState(next);
         void engine.runTask(next);
@@ -533,16 +538,16 @@ function Session(props: { initialState: PairState }): JSX.Element {
       case 'status': setNotice(<Text dimColor>{state.status} · iter {formatIterations(state.iteration, state.maxIterations)} · {state.messages.length} messages · {state.modifiedFiles.length} files</Text>); break;
       case 'files': setNotice(
         state.modifiedFiles.length === 0 ? <Text dimColor>No files modified yet.</Text> :
-        <Box flexDirection="column">{state.modifiedFiles.map((f, i) => <Text key={i}><Text color={colors.success}>{f.status}</Text>  {f.path}</Text>)}</Box>); break;
+        <Box flexDirection="column">{state.modifiedFiles.map((f) => <Text key={f.path}><Text color={colors.success}>{f.status}</Text>  {f.path}</Text>)}</Box>); break;
       case 'diff': {
-        let out = '';
-        try { out = execSync('git diff HEAD --stat', { cwd: state.directory, encoding: 'utf-8' }).trim(); } catch { /* ignore */ }
-        setNotice(<Text dimColor>{out || 'No git diff available.'}</Text>); break;
+        setNotice(<Text dimColor>loading diff…</Text>);
+        void getGitDiffStat(state.directory).then(out => setNotice(<Text dimColor>{out.trim() || 'No git diff available.'}</Text>)).catch(() => setNotice(<Text dimColor>No git diff available.</Text>));
+        break;
       }
       case 'profiles': setNotice(<Text dimColor>{profiles.map(p => p.label).join(' · ') || 'No profiles configured.'}</Text>); break;
       case 'help': setNotice(
         <Box flexDirection="column">{SLASH_COMMANDS.map(c => <Text key={c.name}><Text color={colors.accent}>/{c.name}</Text><Text dimColor>{' '.repeat(Math.max(1, 10 - c.name.length))}{c.description}</Text></Text>)}</Box>); break;
-      case 'clear': write('\x1B[2J\x1B[3J\x1B[H'); setTranscript([]); break;
+      case 'clear': write('\x1B[2J\x1B[3J\x1B[H'); setTranscript([]); setClearTick(t => t + 1); break;
       default: setNotice(<Text color={colors.error}>Unknown command: /{cmd}</Text>);
     }
   };
@@ -559,12 +564,11 @@ function Session(props: { initialState: PairState }): JSX.Element {
   }
 
   if (overlay === 'creds') {
-    return <CredsManager onBack={() => setOverlay('config')} onNotice={setNotice} />;
+    return <CredsManager onBack={() => setOverlay('config')} onNotice={setNotice} onProfilesChanged={() => setProfileTick(t => t + 1)} />;
   }
 
   if (overlay === 'mentor' || overlay === 'runner') {
     const role = overlay === 'mentor' ? 'mentor' : 'executor';
-    const overlayName = overlay;
     return (
       <Box flexDirection="column" marginY={1}>
         <RolePicker
@@ -576,11 +580,17 @@ function Session(props: { initialState: PairState }): JSX.Element {
             ? { pick: { profileName: state.mentor.profileName, baseUrl: state.mentor.baseUrl, model: state.mentor.model }, hint: `${profileLabel(state.mentor.profileName)} / ${state.mentor.model}` }
             : null}
           onCancel={() => setOverlay(null)}
+          onProfilesChanged={() => setProfileTick(t => t + 1)}
           onDone={(pick) => {
-            const next = { ...state, [role]: { ...state[role], profileName: pick.profileName, baseUrl: pick.baseUrl, model: pick.model, sessionId: undefined } };
-            engine.setState(next as PairState);
+            const runtimeUpdate = role === 'mentor'
+              ? { ...state.mentor, profileName: pick.profileName, baseUrl: pick.baseUrl, model: pick.model, sessionId: undefined }
+              : { ...state.executor, profileName: pick.profileName, baseUrl: pick.baseUrl, model: pick.model, sessionId: undefined };
+            const next: PairState = role === 'mentor'
+              ? { ...state, mentor: runtimeUpdate }
+              : { ...state, executor: runtimeUpdate };
+            engine.setState(next);
             setOverlay(null);
-            setNotice(<Text color={role === 'mentor' ? colors.mentor : colors.executor}>{icons.check} {overlayName} → {profileLabel(pick.profileName)} / {pick.model}</Text>);
+            setNotice(<Text color={role === 'mentor' ? colors.mentor : colors.executor}>{icons.check} {role} → {profileLabel(pick.profileName)} / {pick.model}</Text>);
           }}
         />
       </Box>
@@ -591,7 +601,7 @@ function Session(props: { initialState: PairState }): JSX.Element {
 
   return (
     <Box flexDirection="column">
-      <Static items={[{ id: '__banner__' } as { id: string }, ...transcript]}>
+      <Static key={clearTick} items={[{ id: '__banner__' } as { id: string }, ...transcript]}>
         {(item) => {
           if (item.id === '__banner__') return <Banner key="banner" />;
           const m = item as Message;
@@ -622,7 +632,7 @@ function Session(props: { initialState: PairState }): JSX.Element {
           <SlashInput commands={SLASH_COMMANDS} onSubmit={handleLine} placeholder="type a new task, or / for commands" />
         </Box>
       ) : (
-        <Box marginTop={1}><Text dimColor>  esc to stop the current turn</Text></Box>
+        <Box marginTop={1}><Text dimColor>  {stopping ? 'stopping…' : 'esc to stop the current turn'}</Text></Box>
       )}
     </Box>
   );

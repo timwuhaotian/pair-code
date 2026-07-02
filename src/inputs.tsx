@@ -39,7 +39,7 @@ function withCursor(text: string, cursor: number, color: string): JSX.Element {
       {before ? <Text>{before}</Text> : null}
       {under
         ? <Text color={color} inverse>{under}</Text>
-        : <Text color={color}>▌</Text>}
+        : <Text color={color}>{icons.caret}</Text>}
       {after ? <Text>{after}</Text> : null}
     </>
   );
@@ -153,7 +153,7 @@ export function SearchSelect<T>(props: {
         <Text dimColor>{icons.chevron} </Text>
         {query
           ? <Text color={colors.mentor} bold>{withCursor(query, cur, colors.mentor)}</Text>
-          : <><Text dimColor>{props.placeholder ?? 'type to filter'}</Text><Text color={colors.mentor}>▌</Text></>}
+          : <><Text dimColor>{props.placeholder ?? 'type to filter'}</Text><Text color={colors.mentor}>{icons.caret}</Text></>}
       </Text>
       <Text dimColor>── {matches.length} {matches.length === 1 ? 'match' : 'matches'} ──</Text>
       {windowed.map(({ item }, i) => {
@@ -285,7 +285,7 @@ export function SlashInput(props: {
         <Text color={colors.accent} bold>{icons.chevron} </Text>
         {buffer
           ? <Text color={slashActive ? colors.accent : undefined}>{withCursor(buffer, cur, colors.mentor)}</Text>
-          : <><Text dimColor>{props.placeholder ?? 'type a task, or / for commands'}</Text><Text color={colors.mentor}>▌</Text></>}
+          : <><Text dimColor>{props.placeholder ?? 'type a task, or / for commands'}</Text><Text color={colors.mentor}>{icons.caret}</Text></>}
       </Text>
       {slashActive ? (
         <Box flexDirection="column" marginTop={0}>

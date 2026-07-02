@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { execSync } from 'node:child_process';
+import { execFile as execFileCb } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { PairState, AgentActivity, CreatePairInput, Message, AgentRole, PairStatus, ModifiedFile, GreetingState, GreetingMessage } from './types.js';
+
+const execFile = promisify(execFileCb);
 
 const MENTOR_FINISH_SIGNAL = 'TASK_COMPLETE';
 // Same regex must be applied to BOTH the candidate line and the sentinel so
@@ -110,12 +113,17 @@ export function setPairStatus(state: PairState, status: PairStatus, detail?: str
     s.mentor = { ...s.mentor, activity: idleActivity('Mission finished') };
     s.executor = { ...s.executor, activity: idleActivity('idle') };
   } else if (status === 'paused') {
+    s.finishedAt = nowMs();
     s.mentor = { ...s.mentor, activity: idleActivity('Paused') };
     s.executor = { ...s.executor, activity: idleActivity('Paused') };
   } else if (status === 'error') {
+    s.finishedAt = nowMs();
     s.lastError = detail ?? s.lastError ?? 'Unknown error';
     s.mentor = { ...s.mentor, activity: { phase: 'error', label: 'Error', detail, startedAt: nowMs(), updatedAt: nowMs() } };
     s.executor = { ...s.executor, activity: { phase: 'error', label: 'Error', detail, startedAt: nowMs(), updatedAt: nowMs() } };
+  } else {
+    // Active/idle statuses — clear any stale finishedAt from a prior terminal state.
+    s.finishedAt = undefined;
   }
   return s;
 }
@@ -158,25 +166,26 @@ export function getConversationHistory(state: PairState): string {
 }
 
 // 64 MiB: large repos can emit name-status / ls-files output past the 1 MiB
-// execSync default, which otherwise throws ENOBUFS and silently drops changes.
+// exec default, which otherwise throws ENOBUFS and silently drops changes.
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+const GIT_TIMEOUT_MS = 30_000;
 
 /**
  * Classify the directory's git state. Returns 'no-git' when the git binary is
  * missing (ENOENT / command not found), 'no-repo' when git runs but the path
  * isn't a work tree, and 'ok' otherwise.
  */
-function probeGitStatus(directory: string): PairState['gitStatus'] {
+async function probeGitStatus(directory: string): Promise<PairState['gitStatus']> {
   try {
-    const out = execSync('git rev-parse --is-inside-work-tree', {
+    const { stdout } = await execFile('git', ['rev-parse', '--is-inside-work-tree'], {
       cwd: directory,
       encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
       maxBuffer: GIT_MAX_BUFFER,
+      timeout: GIT_TIMEOUT_MS,
     });
-    return out.trim() === 'true' ? 'ok' : 'no-repo';
+    return stdout.trim() === 'true' ? 'ok' : 'no-repo';
   } catch (err) {
-    // ENOENT (binary absent) or shell "command not found" (exit 127) → no git.
+    // ENOENT (binary absent) or exit 127 ("command not found") → no git.
     const code = (err as NodeJS.ErrnoException & { status?: number }).code;
     const status = (err as { status?: number }).status;
     if (code === 'ENOENT' || status === 127) return 'no-git';
@@ -185,19 +194,18 @@ function probeGitStatus(directory: string): PairState['gitStatus'] {
   }
 }
 
-export async function getGitChanges(directory: string, state?: PairState): Promise<ModifiedFile[]> {
-  // Determine and record git availability before scanning so the UI can warn
-  // when change tracking is disabled. On any non-'ok' status we still return []
-  // so callers stay unchanged.
-  const gitStatus = probeGitStatus(directory);
-  if (state) state.gitStatus = gitStatus;
-  if (gitStatus !== 'ok') return [];
+export async function getGitChanges(directory: string): Promise<{ files: ModifiedFile[]; gitStatus: PairState['gitStatus'] }> {
+  // Determine git availability before scanning so the UI can warn when change
+  // tracking is disabled. On any non-'ok' status we still return [] so callers
+  // stay unchanged. The caller applies gitStatus via immutable update.
+  const gitStatus = await probeGitStatus(directory);
+  if (gitStatus !== 'ok') return { files: [], gitStatus };
 
   try {
     // core.quotePath=false keeps non-ASCII paths verbatim instead of C-quoted
     // octal escapes (e.g. "\303\251" for "é").
-    const tracked = execSync('git -c core.quotePath=false diff --name-status HEAD', { cwd: directory, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: GIT_MAX_BUFFER });
-    const untracked = execSync('git -c core.quotePath=false ls-files --others --exclude-standard', { cwd: directory, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: GIT_MAX_BUFFER });
+    const { stdout: tracked } = await execFile('git', ['-c', 'core.quotePath=false', 'diff', '--name-status', 'HEAD'], { cwd: directory, encoding: 'utf-8', maxBuffer: GIT_MAX_BUFFER, timeout: GIT_TIMEOUT_MS });
+    const { stdout: untracked } = await execFile('git', ['-c', 'core.quotePath=false', 'ls-files', '--others', '--exclude-standard'], { cwd: directory, encoding: 'utf-8', maxBuffer: GIT_MAX_BUFFER, timeout: GIT_TIMEOUT_MS });
 
     const files: ModifiedFile[] = tracked.trim().split('\n').filter(Boolean).map(line => {
       const parts = line.split('\t');
@@ -213,9 +221,27 @@ export async function getGitChanges(directory: string, state?: PairState): Promi
       files.push({ path, status: '??' });
     }
 
-    return files;
+    return { files, gitStatus };
   } catch {
-    return [];
+    return { files: [], gitStatus };
+  }
+}
+
+/**
+ * Run `git diff HEAD --stat` in the given directory and return the output
+ * string (empty on error). Used by the `/diff` command.
+ */
+export async function getGitDiffStat(directory: string): Promise<string> {
+  try {
+    const { stdout } = await execFile('git', ['diff', 'HEAD', '--stat'], {
+      cwd: directory,
+      encoding: 'utf-8',
+      maxBuffer: GIT_MAX_BUFFER,
+      timeout: GIT_TIMEOUT_MS,
+    });
+    return stdout.trim();
+  } catch {
+    return '';
   }
 }
 
@@ -256,4 +282,34 @@ export function addGreetingMessage(state: PairState, from: 'mentor' | 'executor'
 
 export function isGreetingComplete(state: PairState): boolean {
   return state.greetingState?.isComplete ?? false;
+}
+
+export function freshTask(prev: PairState, spec: string): PairState {
+  let s = createPairState({
+    directory: prev.directory,
+    spec,
+    mentor: { role: 'mentor', profileName: prev.mentor.profileName, baseUrl: prev.mentor.baseUrl, model: prev.mentor.model },
+    executor: { role: 'executor', profileName: prev.executor.profileName, baseUrl: prev.executor.baseUrl, model: prev.executor.model },
+    maxIterations: prev.maxIterations,
+  });
+  s = addMessage(s, { from: 'human', to: 'mentor', type: 'feedback', content: spec });
+  return s;
+}
+
+// A from-scratch greeting smoke-test: keep the configured endpoints/models but
+// drop prior sessionIds so each role starts a clean session, reset iteration,
+// and seed greetingState. No task spec, no messages, no modified files.
+export function freshGreeting(prev: PairState): PairState {
+  return {
+    ...createPairState({
+      directory: prev.directory,
+      spec: '',
+      mentor: { role: 'mentor', profileName: prev.mentor.profileName, baseUrl: prev.mentor.baseUrl, model: prev.mentor.model },
+      executor: { role: 'executor', profileName: prev.executor.profileName, baseUrl: prev.executor.baseUrl, model: prev.executor.model },
+      maxIterations: prev.maxIterations,
+    }),
+    status: 'greeting',
+    turn: 'mentor',
+    greetingState: initializeGreetingState(),
+  };
 }

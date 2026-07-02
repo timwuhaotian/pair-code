@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import type { PairState, ToolEvent } from './types.js';
 import { runPairEngine, runGreetingSession, killActiveTurn, type EngineCallbacks } from './process.js';
 
@@ -19,6 +19,9 @@ export function useEngine(initial: PairState | null): EngineHook {
   const [liveTools, setLiveTools] = useState<ToolEvent[]>([]);
   const [running, setRunning] = useState(false);
   const stopRef = useRef(false);
+  // Synchronous guard for concurrent-run prevention — `running` state is
+  // async (React batches) so it can't be relied on inside the same tick.
+  const runningRef = useRef(false);
   // Stream deltas accumulate in a ref and are flushed to React state on a
   // timer, so a fast token stream can't trigger a re-render per token.
   const liveTextRef = useRef('');
@@ -26,18 +29,16 @@ export function useEngine(initial: PairState | null): EngineHook {
   const setState = useCallback((s: PairState) => setStateRaw(s), []);
 
   // Shared callback builder so runTask and runGreeting stay in lockstep —
-  // avoids drift in how streaming state is mirrored to React.
-  const makeCallbacks = (): EngineCallbacks => ({
+  // avoids drift in how streaming state is mirrored to React. useCallback
+  // keeps it stable so runWith's dependency array stays valid.
+  const makeCallbacks = useCallback((): EngineCallbacks => ({
     onStateUpdate: (s) => setStateRaw(s),
-    onLog: () => { /* logs are surfaced via activity; raw stderr not shown in main UI */ },
-    onActivity: () => { /* state already reflects activity */ },
     onTextDelta: (_role, text) => { liveTextRef.current += text; },
     onToolStart: (_role, ev) => setLiveTools(prev => [...prev, ev]),
     onToolEnd: (_role, id, status) => setLiveTools(prev => prev.map(t => t.id === id ? { ...t, status } : t)),
     onMessage: (s) => { setStateRaw(s); liveTextRef.current = ''; setLiveText(''); setLiveTools([]); },
-    onError: () => { /* captured into state.lastError */ },
     shouldStop: () => stopRef.current,
-  });
+  }), []);
 
   // Shared run loop: reset streaming state, flush deltas on a timer, then
   // delegate to the given engine function. runTask and runGreeting are thin
@@ -46,6 +47,11 @@ export function useEngine(initial: PairState | null): EngineHook {
     start: PairState,
     engine: (state: PairState, cbs: EngineCallbacks) => Promise<PairState>,
   ): Promise<PairState> => {
+    // The pair engine is strictly sequential (one active query at a time via
+    // the module-level activeQuery in process.ts). Bail if a run is already
+    // in flight to avoid corrupting that shared state.
+    if (runningRef.current) return start;
+    runningRef.current = true;
     stopRef.current = false;
     setRunning(true);
     liveTextRef.current = '';
@@ -62,8 +68,9 @@ export function useEngine(initial: PairState | null): EngineHook {
       setLiveText('');
       setLiveTools([]);
       setRunning(false);
+      runningRef.current = false;
     }
-  }, []);
+  }, [makeCallbacks]);
 
   const runTask = useCallback(
     (start: PairState): Promise<PairState> => runWith(start, runPairEngine),
@@ -80,5 +87,9 @@ export function useEngine(initial: PairState | null): EngineHook {
     killActiveTurn();
   }, []);
 
-  return { state, liveText, liveTools, running, runTask, runGreeting, requestStop, setState };
+  // Memoize so consumers (e.g. app.tsx useEffect deps) get a stable reference
+  // across re-renders that don't change the underlying values.
+  return useMemo(() => ({
+    state, liveText, liveTools, running, runTask, runGreeting, requestStop, setState,
+  }), [state, liveText, liveTools, running, runTask, runGreeting, requestStop, setState]);
 }

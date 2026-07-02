@@ -65,7 +65,7 @@ export function persistProfile(input: { baseUrl: string; apiKey: string; name?: 
     throw new Error(err instanceof Error ? err.message : 'failed to read saved config');
   }
   const existing = Object.keys(cfg.profiles).find(n => cfg.profiles[n].baseUrl === baseUrl);
-  const name = existing ?? uniqueName(input.name ?? deriveName(baseUrl));
+  const name = existing ?? uniqueName(sanitizeName(input.name ?? deriveName(baseUrl)));
   cfg.profiles[name] = { baseUrl, apiKey: input.apiKey, defaultModel: input.defaultModel };
   writeConfig(cfg);
   return { name, label: humanizeProfileName(name), baseUrl, defaultModel: input.defaultModel, apiKey: input.apiKey };
@@ -79,15 +79,6 @@ export function addEndpoint(input: { baseUrl: string; apiKey: string; remember: 
 /** Saved (persisted) profiles only, secrets stripped — for the /config manager. */
 export function persistedProfiles(): Profile[] {
   return loadPersistedProfiles();
-}
-
-export function isProfilePersisted(name: string): boolean {
-  // A corrupt config has no usable saved profiles — treat as not persisted.
-  try {
-    return name in readConfig().profiles;
-  } catch {
-    return false;
-  }
 }
 
 /** Delete a saved profile from disk. Returns false if it wasn't saved. */
@@ -106,12 +97,17 @@ export function forgetProfile(name: string): boolean {
   return true;
 }
 
+/** Sanitize a profile name to alphanumeric, hyphen, and underscore only. */
+function sanitizeName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, '-');
+}
+
 function deriveName(baseUrl: string): string {
   try {
     const host = new URL(baseUrl).hostname;
     const skip = new Set(['api', 'open', 'www', 'gateway', 'ark', 'dashscope']);
     const label = host.split('.').find(p => !skip.has(p)) ?? host;
-    return label.toLowerCase();
+    return sanitizeName(label.toLowerCase());
   } catch {
     return 'custom';
   }
@@ -139,10 +135,22 @@ export function loadProfiles(): Profile[] {
   for (const raw of names) {
     const key = envValue(`${PROFILE_PREFIX}${raw}_KEY`);
     if (!key) continue; // not ready — no secret
+    const baseUrl = envValue(`${PROFILE_PREFIX}${raw}_BASE_URL`) ?? '';
+    // Validate the base URL — env profiles skip the interactive form's URL
+    // check, so a malformed PAIR_PROFILE_<NAME>_BASE_URL would surface later
+    // as an opaque request failure. Skip the profile and warn instead.
+    if (baseUrl) {
+      try {
+        new URL(baseUrl);
+      } catch {
+        process.stderr.write(`pair-code: skipping profile "${raw.toLowerCase()}": invalid base URL "${baseUrl}"\n`);
+        continue;
+      }
+    }
     profiles.push({
       name: raw.toLowerCase(),
       label: humanizeProfileName(raw),
-      baseUrl: envValue(`${PROFILE_PREFIX}${raw}_BASE_URL`) ?? '',
+      baseUrl,
       defaultModel: envValue(`${PROFILE_PREFIX}${raw}_MODEL`),
     });
   }
@@ -176,9 +184,9 @@ export function loadProfiles(): Profile[] {
 /**
  * Saved profiles from the on-disk config, secrets stripped. If the config is
  * corrupted, degrade to an empty list rather than crashing. Read paths
- * (isProfilePersisted / resolveProfile's saved-key fallback) degrade the same
- * way, while write paths (persistProfile / forgetProfile) instead surface a
- * readable error so they never overwrite — and destroy — a broken file.
+ * (resolveProfile's saved-key fallback) degrade the same way, while write
+ * paths (persistProfile / forgetProfile) instead surface a readable error so
+ * they never overwrite — and destroy — a broken file.
  */
 function loadPersistedProfiles(): Profile[] {
   let cfg: PairConfig;

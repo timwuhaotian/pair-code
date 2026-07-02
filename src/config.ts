@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
-import { join } from 'node:path';
-import { mkdirSync, readFileSync, writeFileSync, renameSync, chmodSync, existsSync } from 'node:fs';
+import { join, basename } from 'node:path';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, chmodSync, existsSync, readdirSync, unlinkSync, statSync } from 'node:fs';
 
 /**
  * Opt-in on-disk config. Unlike env/session profiles (process memory only),
@@ -64,8 +64,15 @@ export function readConfig(): PairConfig {
   } catch (err) {
     throw new CorruptConfigError(path, err);
   }
+  const version = typeof parsed.version === 'number' ? parsed.version : CONFIG_VERSION;
+  // TODO: future migrations live here — bump CONFIG_VERSION and add a step that
+  // transforms the prior shape into the current one before returning. For now we
+  // only preserve the on-disk version and warn if it differs from what we expect.
+  if (version !== CONFIG_VERSION) {
+    process.stderr.write(`pair-code: config version ${version} differs from expected ${CONFIG_VERSION}\n`);
+  }
   return {
-    version: typeof parsed.version === 'number' ? parsed.version : CONFIG_VERSION,
+    version,
     profiles: sanitiseProfiles(parsed.profiles),
   };
 }
@@ -85,7 +92,22 @@ export function writeConfig(config: PairConfig): void {
   } catch {
     /* best-effort: not all filesystems honour POSIX perms */
   }
+  // Verify the config directory is owned by the current user — a dir owned by
+  // another user could be pre-populated with a tampered config or temp file.
+  if (typeof process.getuid === 'function' && statSync(dir).uid !== process.getuid()) {
+    throw new Error(`config directory ${dir} is not owned by the current user`);
+  }
   const path = configPath();
+  // Clean up stale temp files from previous crashed writes — they may contain
+  // API keys and would otherwise persist indefinitely.
+  try {
+    const prefix = basename(path) + '.tmp-';
+    for (const f of readdirSync(dir)) {
+      if (f.startsWith(prefix)) {
+        try { unlinkSync(join(dir, f)); } catch {}
+      }
+    }
+  } catch {}
   const tmp = `${path}.tmp-${process.pid}`;
   const data = JSON.stringify({ ...config, version: CONFIG_VERSION }, null, 2);
   writeFileSync(tmp, data, { mode: 0o600 });

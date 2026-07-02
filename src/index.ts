@@ -1,12 +1,16 @@
 import { resolve } from 'node:path';
 import { statSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
-import { createElement } from 'react';
-import { render } from 'ink';
+import { Component, createElement } from 'react';
+import type { ReactNode } from 'react';
+import { render, Text, Box } from 'ink';
 import { App } from './app.js';
 import { loadProfiles } from './providers.js';
 import { readConfig, configPath } from './config.js';
+
+const execFileAsync = promisify(execFile);
 
 // Derive the version from package.json at runtime so it can't drift from the
 // published build. createRequire resolves '../package.json' to the package root
@@ -87,17 +91,59 @@ function printProfiles(): void {
  * Warn (non-fatally) if `directory` isn't inside a git work tree. The engine's
  * change tracking shells out to git in this dir; outside a repo getGitChanges()
  * just returns [], so the session still runs — the user only loses the modified-
- * file list. Uses spawnSync with piped stdio so git's own output never leaks.
+ * file list. Uses async execFile so startup isn't blocked by a git round-trip.
  */
-function warnIfNotGitRepo(directory: string): void {
-  const probe = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: directory, stdio: ['ignore', 'pipe', 'pipe'] });
-  const inside = probe.status === 0 && probe.stdout.toString().trim() === 'true';
+async function warnIfNotGitRepo(directory: string): Promise<void> {
+  let inside = false;
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: directory });
+    inside = stdout.trim() === 'true';
+  } catch {
+    // git missing or not a repo — treat as outside a work tree.
+  }
   if (!inside) {
     console.error(`WARNING: ${directory} is not inside a git repository — change tracking will be disabled.`);
   }
 }
 
-function main(): void {
+// ── Error boundary ──────────────────────────────────────────────────────
+// Catches render-time errors inside the Ink tree so a broken component shows
+// a readable message instead of an opaque raw-mode / React stack crash.
+
+interface ErrorBoundaryProps {
+  children: ReactNode;
+}
+
+interface ErrorBoundaryState {
+  error: Error | null;
+}
+
+class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(): void {
+    // Give Ink a tick to paint the fallback UI, then exit non-zero.
+    setTimeout(() => process.exit(1), 100);
+  }
+
+  render(): ReactNode {
+    if (this.state.error) {
+      return createElement(
+        Box,
+        { flexDirection: 'column' },
+        createElement(Text, { color: 'red' }, `Something went wrong: ${this.state.error.message}`),
+        createElement(Text, { dimColor: true }, 'Please restart the app.'),
+      );
+    }
+    return this.props.children;
+  }
+}
+
+async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
   // Informational flags first so they keep working even when stdin is piped.
@@ -159,9 +205,13 @@ function main(): void {
   }
 
   // README requires a git repo for change tracking; warn but don't block. (#20)
-  warnIfNotGitRepo(directory);
+  await warnIfNotGitRepo(directory);
 
-  const instance = render(createElement(App, { directory, initialSpec }));
+  const instance = render(
+    createElement(ErrorBoundary, null,
+      createElement(App, { directory, initialSpec }),
+    ),
+  );
   // Observe the render lifecycle so an unhandled error inside Ink surfaces with
   // a non-zero exit rather than being swallowed by a fire-and-forget render.
   instance.waitUntilExit().catch((err: unknown) => {
@@ -181,9 +231,7 @@ process.on('unhandledRejection', (reason) => {
   process.exit(1);
 });
 
-try {
-  main();
-} catch (err) {
+main().catch((err) => {
   console.error(err instanceof Error ? err.message : String(err));
   process.exit(1);
-}
+});

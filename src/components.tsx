@@ -1,17 +1,44 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { JSX } from 'react';
-import { Box, Text } from 'ink';
+import { Box, Text, useStdout } from 'ink';
 import type { PairState, Message, ToolEvent, AgentRuntime, ActivityPhase } from './types.js';
 import { colors, icons, heroGradient, rgbHex, spinnerFrames, formatDuration, formatIterations, formatTokens, truncate } from './ui.js';
 
 // ── Spinner ─────────────────────────────────────────────────────────────
 
-export function Spinner({ color }: { color?: string }): JSX.Element {
+// Shared spinner animation: a single module-level 80ms interval drives every
+// mounted Spinner via a ref-counted subscription, so concurrent spinners
+// (live turn header + running tool lines) don't each spawn their own timer.
+const spinnerSubs = new Set<(f: number) => void>();
+let spinnerTimer: ReturnType<typeof setInterval> | null = null;
+
+function subscribeSpinner(cb: (f: number) => void): () => void {
+  spinnerSubs.add(cb);
+  if (spinnerTimer === null) {
+    let frame = 0;
+    spinnerTimer = setInterval(() => {
+      frame = (frame + 1) % spinnerFrames.length;
+      for (const sub of spinnerSubs) sub(frame);
+    }, 80);
+  }
+  return () => {
+    spinnerSubs.delete(cb);
+    if (spinnerSubs.size === 0 && spinnerTimer !== null) {
+      clearInterval(spinnerTimer);
+      spinnerTimer = null;
+    }
+  };
+}
+
+/** Current spinner frame, updated by the shared interval. */
+function useSpinnerFrame(): number {
   const [frame, setFrame] = useState(0);
-  useEffect(() => {
-    const t = setInterval(() => setFrame(f => (f + 1) % spinnerFrames.length), 80);
-    return () => clearInterval(t);
-  }, []);
+  useEffect(() => subscribeSpinner(setFrame), []);
+  return frame;
+}
+
+export function Spinner({ color }: { color?: string }): JSX.Element {
+  const frame = useSpinnerFrame();
   return <Text color={color ?? colors.accent}>{spinnerFrames[frame]}</Text>;
 }
 
@@ -58,7 +85,7 @@ export function Banner(): JSX.Element {
         return <Text key={i} color={rgbHex(c)}>  {row}</Text>;
       })}
       <Text>
-        {'  '}<Text color={rgbHex([217, 70, 239])}>{icons.sparkle}</Text>
+        {'  '}<Text color={rgbHex(heroGradient[4])}>{icons.sparkle}</Text>
         {'  '}<Text bold>Dual-agent AI pair programming</Text>
         <Text dimColor> · for the terminal</Text>
       </Text>
@@ -95,9 +122,15 @@ function formatUsd(n: number): string {
 }
 
 export function StatusBar({ state, elapsedMs }: { state: PairState; elapsedMs: number }): JSX.Element {
+  const { stdout } = useStdout();
+  const cols = stdout?.columns ?? 80;
   const color = STATUS_COLOR[state.status] ?? colors.accent;
   const tok = (state.mentor.tokenUsage?.outputTokens ?? 0) + (state.executor.tokenUsage?.outputTokens ?? 0);
   const cost = state.totalCostUsd ?? 0;
+  // On narrow terminals hide the right-side model summary; below 100 cols
+  // shorten model truncation so the bar fits within 80 columns.
+  const hideModels = cols < 80;
+  const modelMax = cols < 100 ? 12 : 22;
   return (
     <Box justifyContent="space-between">
       <Text>
@@ -107,13 +140,15 @@ export function StatusBar({ state, elapsedMs }: { state: PairState; elapsedMs: n
         {tok > 0 ? <Text dimColor>  {formatTokens(tok)} tok</Text> : null}
         {cost > 0 ? <Text dimColor>  {formatUsd(cost)}</Text> : null}
       </Text>
-      <Text>
-        <Text color={colors.mentor}>{icons.mentor} </Text>
-        <Text dimColor>{truncate(state.mentor.model, 22)}</Text>
-        <Text dimColor>   </Text>
-        <Text color={colors.executor}>{icons.executor} </Text>
-        <Text dimColor>{truncate(state.executor.model, 22)}</Text>
-      </Text>
+      {hideModels ? null : (
+        <Text>
+          <Text color={colors.mentor}>{icons.mentor} </Text>
+          <Text dimColor>{truncate(state.mentor.model, modelMax)}</Text>
+          <Text dimColor>   </Text>
+          <Text color={colors.executor}>{icons.executor} </Text>
+          <Text dimColor>{truncate(state.executor.model, modelMax)}</Text>
+        </Text>
+      )}
     </Box>
   );
 }
@@ -215,6 +250,17 @@ function toVerdict(raw: string): Verdict | null {
   };
 }
 
+/** Extract top-level {…} JSON spans via brace counting, handling nesting. */
+function extractJsonBlocks(text: string): string[] {
+  const blocks: string[] = [];
+  let depth = 0, start = -1;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '{') { if (depth === 0) start = i; depth++; }
+    else if (text[i] === '}') { depth--; if (depth === 0 && start >= 0) { blocks.push(text.slice(start, i + 1)); start = -1; } }
+  }
+  return blocks;
+}
+
 /**
  * Extract the verdict block from a mentor review. Scans every fenced code block
  * (```json, a bare ``` fence, or any language tag) and returns the first one
@@ -228,8 +274,8 @@ function parseVerdict(content: string): Verdict | null {
     if (v) return v;
   }
   // No fenced verdict — try each top-level {…} span in document order.
-  for (const m of content.matchAll(/\{[\s\S]*?\}/g)) {
-    const v = toVerdict(m[0]);
+  for (const block of extractJsonBlocks(content)) {
+    const v = toVerdict(block);
     if (v) return v;
   }
   return null;
@@ -243,13 +289,16 @@ function parseVerdict(content: string): Verdict | null {
  * are left untouched.
  */
 function stripVerdictBlocks(content: string): string {
-  return content
-    .replace(/```[^\n]*\n[\s\S]*?```/g, block => {
-      const inner = block.replace(/^```[^\n]*\n/, '').replace(/```$/, '');
-      return toVerdict(inner.trim()) ? '' : block;
-    })
-    .replace(/\{[\s\S]*?\}/g, span => (toVerdict(span) ? '' : span))
-    .trim();
+  let out = content.replace(/```[^\n]*\n[\s\S]*?```/g, block => {
+    const inner = block.replace(/^```[^\n]*\n/, '').replace(/```$/, '');
+    return toVerdict(inner.trim()) ? '' : block;
+  });
+  // Remove top-level {…} spans that parse to a verdict. Brace-counting keeps
+  // nested objects intact; split/join removes every occurrence.
+  for (const block of extractJsonBlocks(out)) {
+    if (toVerdict(block)) out = out.split(block).join('');
+  }
+  return out.trim();
 }
 
 function VerdictChip({ v }: { v: Verdict }): JSX.Element {
@@ -272,8 +321,11 @@ function VerdictChip({ v }: { v: Verdict }): JSX.Element {
 
 export function MessageView({ msg, maxLines = 120 }: { msg: Message; maxLines?: number }): JSX.Element {
   const color = senderColor(msg.from);
-  const verdict = msg.type === 'acceptance' ? parseVerdict(msg.content) : null;
-  const bodyText = (verdict ? stripVerdictBlocks(msg.content) : msg.content) || (verdict?.summary ?? '');
+  const { verdict, bodyText } = useMemo(() => {
+    const v = msg.type === 'acceptance' ? parseVerdict(msg.content) : null;
+    const body = (v ? stripVerdictBlocks(msg.content) : msg.content) || (v?.summary ?? '');
+    return { verdict: v, bodyText: body };
+  }, [msg.content, msg.type]);
   const lines = bodyText.split('\n');
   const shown = lines.length > maxLines ? lines.slice(0, maxLines) : lines;
   const clipped = lines.length - shown.length;
@@ -361,6 +413,15 @@ function gitDisabledReason(gitStatus: PairState['gitStatus']): string | null {
   return null;
 }
 
+/** Truncate a long, potentially multi-line error message for display. */
+function truncateError(msg: string, maxLines = 5, maxChars = 500): string {
+  const lines = msg.split('\n');
+  let out = lines.length > maxLines ? lines.slice(0, maxLines).join('\n') : msg;
+  const clipped = out.length > maxChars;
+  if (clipped) out = out.slice(0, maxChars);
+  return (lines.length > maxLines || clipped) ? `${out}${icons.ellipsis}` : out;
+}
+
 export function ResultPanel({ state }: { state: PairState }): JSX.Element {
   if (state.status === 'finished') {
     const dur = state.finishedAt && state.createdAt ? formatDuration(state.finishedAt - state.createdAt) : '—';
@@ -372,8 +433,8 @@ export function ResultPanel({ state }: { state: PairState }): JSX.Element {
         {state.modifiedFiles.length > 0 ? (
           <Box flexDirection="column" marginTop={1}>
             <Text bold>{plural(state.modifiedFiles.length, 'file')} changed</Text>
-            {state.modifiedFiles.slice(0, 10).map((f, i) => (
-              <Text key={i}><Text color={colors.success}>{f.status}</Text>  {f.path}</Text>
+            {state.modifiedFiles.slice(0, 10).map(f => (
+              <Text key={f.path}><Text color={colors.success}>{f.status}</Text>  {f.path}</Text>
             ))}
           </Box>
         ) : gitDisabledReason(state.gitStatus) ? (
@@ -395,7 +456,7 @@ export function ResultPanel({ state }: { state: PairState }): JSX.Element {
     return (
       <Box flexDirection="column" borderStyle="round" borderColor={colors.error} paddingX={1}>
         <Text color={colors.error} bold>{icons.cross} Session Failed</Text>
-        {state.lastError ? <Text>{state.lastError}</Text> : null}
+        {state.lastError ? <Text>{truncateError(state.lastError)}</Text> : null}
         <Text dimColor>Check /model, fix the cause, then retry with a new task.</Text>
       </Box>
     );

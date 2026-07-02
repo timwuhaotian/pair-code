@@ -1,4 +1,4 @@
-import { query, type Query, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type Query, type Options } from '@anthropic-ai/claude-agent-sdk';
 import type { PairState, AgentRuntime, ToolEvent, TokenUsage, ActivityPhase } from './types.js';
 import { resolveProfile, profileEnv } from './providers.js';
 import { addMessage, hasFinishSignal, setPairStatus, updateActivity, getConversationHistory, getGitChanges, prepareRun, getTaskSpec, initializeGreetingState, addGreetingMessage, isGreetingComplete } from './state.js';
@@ -7,10 +7,12 @@ const TURN_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes per turn
 const EMPTY_OUTPUT = '(No textual output produced)';
 
 // The mentor is statically read-only: it may inspect the repo to verify, but
-// can never mutate it. Everything not in this allowlist is also explicitly
-// disallowed so the model is never even offered a write/exec tool.
+// can never mutate it. The `tools` option (in runTurn's Options) is the
+// primary enforcement — it restricts the mentor's *available* tool set to only
+// these three. `disallowedTools` below is defense-in-depth in case a future SDK
+// change re-introduces a tool outside the allowlist.
 const READ_ONLY_TOOLS = ['Read', 'Grep', 'Glob'];
-const NON_READ_TOOLS = ['Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Bash', 'BashOutput', 'KillShell', 'WebFetch', 'WebSearch', 'TodoWrite'];
+const NON_READ_TOOLS = ['Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Bash', 'BashOutput', 'KillShell', 'WebFetch', 'WebSearch', 'TodoWrite', 'Task', 'Skill'];
 
 // ── Streaming primitives ────────────────────────────────────────────────
 
@@ -20,7 +22,6 @@ export interface TurnCallbacks {
   onToolEnd: (id: string, status: 'done' | 'error') => void;
   onSessionId: (id: string) => void;
   onActivity: (phase: ActivityPhase, label: string) => void;
-  onLog: (line: string) => void;
 }
 
 export interface TurnResult {
@@ -29,6 +30,11 @@ export interface TurnResult {
   tokenUsage?: TokenUsage;
 }
 
+// Module-level reference to the active query, used by killActiveTurn() to
+// interrupt an in-flight turn. This is safe because the pair engine is
+// strictly sequential: at most one runTurn() is ever in flight (the loop
+// awaits each turn before starting the next), so there is no concurrent
+// access to this variable.
 let activeQuery: Query | null = null;
 
 export function killActiveTurn(): void {
@@ -40,13 +46,12 @@ export function killActiveTurn(): void {
   }
 }
 
-interface LooseBlock { type?: string; id?: string; name?: string; text?: string; input?: Record<string, unknown>; tool_use_id?: string; is_error?: boolean; content?: unknown }
-interface LooseStreamEvent { type?: string; delta?: { type?: string; text?: string }; content_block?: { type?: string } }
-
-function toolTarget(input: Record<string, unknown> | undefined): string | undefined {
-  if (!input) return undefined;
+/** Best-effort extraction of a human-readable target (file path, command, …) from a tool_use input. */
+function toolTarget(input: unknown): string | undefined {
+  if (!input || typeof input !== 'object') return undefined;
+  const obj = input as Record<string, unknown>;
   for (const key of ['file_path', 'path', 'notebook_path', 'command', 'pattern', 'url', 'query']) {
-    const v = input[key];
+    const v = obj[key];
     if (typeof v === 'string' && v.trim()) return v.trim();
   }
   return undefined;
@@ -73,8 +78,15 @@ export async function runTurn(
     env: profileEnv(resolved),
     resume: runtime.sessionId,
     includePartialMessages: true,
-    permissionMode: 'bypassPermissions',
+    // The executor runs with full tool access and bypassed permissions (it
+    // writes code). The mentor is read-only: `tools` restricts its available
+    // set to Read/Grep/Glob (the primary enforcement), with `disallowedTools`
+    // as defense-in-depth. Because the mentor only has safe read tools, it
+    // does not need bypassPermissions or allowDangerouslySkipPermissions.
+    permissionMode: isMentor ? undefined : 'bypassPermissions',
+    allowDangerouslySkipPermissions: isMentor ? undefined : true,
     abortController: controller,
+    tools: isMentor ? READ_ONLY_TOOLS : { type: 'preset', preset: 'claude_code' },
     allowedTools: isMentor ? READ_ONLY_TOOLS : undefined,
     disallowedTools: isMentor ? NON_READ_TOOLS : undefined,
     systemPrompt: {
@@ -85,14 +97,15 @@ export async function runTurn(
     stderr: (data: string) => {
       const line = data.trim();
       if (!line) return;
-      cbs.onLog(`[stderr] ${line}`);
       const lower = line.toLowerCase();
-      if (/(rate ?limit|exhausted|429|throttl|overload)/.test(lower)) cbs.onActivity('thinking', 'Throttled — retrying');
+      if (/(rate ?limit|exhausted|429|throttl|overload)/.test(lower)) cbs.onActivity('thinking', 'Throttled — waiting');
       else if (/(auth|unauthor|invalid api key|credential)/.test(lower)) cbs.onActivity('thinking', 'Auth issue');
     },
   };
 
-  let streamedText = '';
+  // Accumulate streamed text in an array and join once at the end — avoids
+  // O(n²) string concatenation on very long responses.
+  const textChunks: string[] = [];
   let finalText = '';
   let sessionId: string | undefined = runtime.sessionId;
   let tokenUsage: TokenUsage | undefined;
@@ -109,7 +122,7 @@ export async function runTurn(
   activeQuery = q;
 
   try {
-    for await (const msg of q as AsyncIterable<SDKMessage>) {
+    for await (const msg of q) {
       if (msg.type === 'system' && msg.subtype === 'init') {
         sessionId = msg.session_id;
         cbs.onSessionId(sessionId);
@@ -118,30 +131,30 @@ export async function runTurn(
       }
 
       if (msg.type === 'stream_event') {
-        const ev = msg.event as unknown as LooseStreamEvent;
-        if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta' && ev.delta.text) {
+        const ev = msg.event;
+        if (ev.type === 'content_block_delta' && ev.delta.type === 'text_delta' && ev.delta.text) {
           if (firstToken) { cbs.onActivity('responding', 'Writing'); firstToken = false; }
-          streamedText += ev.delta.text;
+          textChunks.push(ev.delta.text);
           cbs.onTextDelta(ev.delta.text);
         }
         continue;
       }
 
       if (msg.type === 'assistant') {
-        const blocks = (msg.message.content as unknown as LooseBlock[]) ?? [];
-        for (const b of blocks) {
-          if (b.type === 'tool_use' && b.id) {
-            cbs.onActivity('using_tools', `${b.name ?? 'tool'}`);
-            cbs.onToolStart({ id: b.id, name: b.name ?? 'tool', target: toolTarget(b.input), status: 'running' });
+        for (const b of msg.message.content) {
+          if (b.type === 'tool_use') {
+            cbs.onActivity('using_tools', b.name);
+            cbs.onToolStart({ id: b.id, name: b.name, target: toolTarget(b.input), status: 'running' });
           }
         }
         continue;
       }
 
       if (msg.type === 'user') {
-        const blocks = (msg.message.content as unknown as LooseBlock[]) ?? [];
+        const content = msg.message.content;
+        const blocks = typeof content === 'string' ? [] : content;
         for (const b of blocks) {
-          if (b.type === 'tool_result' && b.tool_use_id) {
+          if (b.type === 'tool_result') {
             cbs.onToolEnd(b.tool_use_id, b.is_error ? 'error' : 'done');
           }
         }
@@ -150,16 +163,15 @@ export async function runTurn(
 
       if (msg.type === 'result') {
         sessionId = msg.session_id;
-        const u = msg.usage as unknown as { output_tokens?: number; input_tokens?: number } | undefined;
         tokenUsage = {
-          outputTokens: u?.output_tokens ?? 0,
-          inputTokens: u?.input_tokens,
+          outputTokens: msg.usage.output_tokens,
+          inputTokens: msg.usage.input_tokens,
           costUsd: msg.total_cost_usd,
         };
         if (msg.subtype === 'success') {
           finalText = msg.result;
         } else {
-          const detail = (msg.errors && msg.errors.length) ? msg.errors.join('; ') : msg.subtype;
+          const detail = msg.errors.length ? msg.errors.join('; ') : msg.subtype;
           throw new Error(`${role} agent ended with ${msg.subtype}: ${detail}`);
         }
       }
@@ -177,7 +189,7 @@ export async function runTurn(
   }
 
   return {
-    output: finalText.trim() || streamedText.trim() || EMPTY_OUTPUT,
+    output: finalText.trim() || textChunks.join('').trim() || EMPTY_OUTPUT,
     sessionId,
     tokenUsage,
   };
@@ -232,13 +244,10 @@ const GREETING_PROMPTS = {
 
 export interface EngineCallbacks {
   onStateUpdate: (state: PairState) => void;
-  onLog: (role: string, line: string) => void;
-  onActivity: (role: string, phase: ActivityPhase, label: string) => void;
   onTextDelta: (role: string, text: string) => void;
   onToolStart: (role: string, ev: ToolEvent) => void;
   onToolEnd: (role: string, id: string, status: 'done' | 'error') => void;
   onMessage: (state: PairState) => void;
-  onError: (error: string) => void;
   shouldStop: () => boolean;
 }
 
@@ -257,7 +266,7 @@ interface EngineLoop {
 
 function createEngineLoop(initial: PairState, callbacks: EngineCallbacks): EngineLoop {
   const loop = { state: initial } as EngineLoop;
-  const { onActivity, onTextDelta, onToolStart, onToolEnd, onLog, shouldStop, onStateUpdate } = callbacks;
+  const { onTextDelta, onToolStart, onToolEnd, shouldStop, onStateUpdate } = callbacks;
 
   loop.update = (s: PairState) => { loop.state = s; onStateUpdate(s); };
 
@@ -272,10 +281,8 @@ function createEngineLoop(initial: PairState, callbacks: EngineCallbacks): Engin
     },
     onActivity: (phase, label) => {
       loop.state = updateActivity(loop.state, role, phase, label);
-      onActivity(role, phase, label);
       loop.update(loop.state);
     },
-    onLog: (line) => onLog(role, line),
   });
 
   loop.checkStop = (): boolean => {
@@ -307,7 +314,7 @@ export async function runPairEngine(
 ): Promise<PairState> {
   const loop = createEngineLoop(initialState, callbacks);
   const { update, turnCallbacks, checkStop } = loop;
-  const { onLog, onMessage, onError } = callbacks;
+  const { onMessage } = callbacks;
 
   // Derive resumption from progress, not from a sessionId: a mentor-endpoint
   // change clears mentor.sessionId, but the run still has prior iterations and
@@ -341,7 +348,6 @@ export async function runPairEngine(
       update(loop.state);
       if (checkStop()) return loop.state;
 
-      onLog('mentor', 'Planning…');
       const mentorResult = await runTurn(loop.state.directory, 'mentor', loop.state.mentor, HANDOFF_PROMPTS.initialMentor(spec), turnCallbacks('mentor'));
 
       loop.state = applyTurnResult(loop.state, 'mentor', mentorResult);
@@ -355,7 +361,6 @@ export async function runPairEngine(
       // back to executor with feedback"), not an actionable plan.
       const lastMentorMsg = [...loop.state.messages].reverse().find(m => m.from === 'mentor' && m.type !== 'handoff');
       latestPlan = lastMentorMsg?.content ?? `Continue the task: ${spec}`;
-      onLog('mentor', 'Resuming…');
     }
 
     while (loop.state.status !== 'finished' && loop.state.status !== 'error' && loop.state.status !== 'paused') {
@@ -365,7 +370,6 @@ export async function runPairEngine(
       update(loop.state);
 
       const history = getConversationHistory(loop.state);
-      onLog('executor', 'Executing…');
       const executorResult = await runTurn(loop.state.directory, 'executor', loop.state.executor, HANDOFF_PROMPTS.mentorToExecutor(latestPlan, spec), turnCallbacks('executor'));
 
       loop.state = applyTurnResult(loop.state, 'executor', executorResult);
@@ -374,8 +378,10 @@ export async function runPairEngine(
       update(loop.state);
       onMessage(loop.state);
 
-      const changes = await getGitChanges(loop.state.directory, loop.state);
-      if (changes.length > 0) { loop.state = { ...loop.state, modifiedFiles: changes }; update(loop.state); }
+      const { files: changes, gitStatus } = await getGitChanges(loop.state.directory);
+      loop.state = { ...loop.state, gitStatus };
+      if (changes.length > 0) loop.state = { ...loop.state, modifiedFiles: changes };
+      update(loop.state);
 
       // No-progress guard: count consecutive executor turns that produced no
       // usable output (empty / EMPTY_OUTPUT) or repeated the prior turn verbatim.
@@ -394,7 +400,6 @@ export async function runPairEngine(
       loop.state = prepareRun(loop.state, 'mentor');
       update(loop.state);
 
-      onLog('mentor', 'Reviewing…');
       const reviewResult = await runTurn(loop.state.directory, 'mentor', loop.state.mentor, HANDOFF_PROMPTS.executorToMentor(executorResult.output, spec, history), turnCallbacks('mentor'));
 
       loop.state = applyTurnResult(loop.state, 'mentor', reviewResult);
@@ -433,7 +438,6 @@ export async function runPairEngine(
     if (callbacks.shouldStop()) {
       loop.state = setPairStatus(loop.state, 'paused', 'Stopped by user during turn');
     } else {
-      onError(msg);
       loop.state = setPairStatus(loop.state, 'error', msg);
     }
     update(loop.state);
@@ -459,7 +463,7 @@ export async function runGreetingSession(
 ): Promise<PairState> {
   const loop = createEngineLoop(initialState, callbacks);
   const { update, turnCallbacks, checkStop } = loop;
-  const { onLog, onMessage, onError } = callbacks;
+  const { onMessage } = callbacks;
 
   if (!loop.state.greetingState) loop.state = { ...loop.state, greetingState: initializeGreetingState() };
 
@@ -469,7 +473,6 @@ export async function runGreetingSession(
     update(loop.state);
     if (checkStop()) return loop.state;
 
-    onLog('mentor', 'Saying hello…');
     const mentorHello = await runTurn(loop.state.directory, 'mentor', loop.state.mentor, GREETING_PROMPTS.mentorHello(), turnCallbacks('mentor'));
     loop.state = applyTurnResult(loop.state, 'mentor', mentorHello);
     loop.state = addGreetingMessage(loop.state, 'mentor', mentorHello.output);
@@ -485,7 +488,6 @@ export async function runGreetingSession(
     update(loop.state);
     if (checkStop()) return loop.state;
 
-    onLog('executor', 'Greeting back…');
     const executorHello = await runTurn(loop.state.directory, 'executor', loop.state.executor, GREETING_PROMPTS.executorHello(mentorHello.output), turnCallbacks('executor'));
     loop.state = applyTurnResult(loop.state, 'executor', executorHello);
     loop.state = addGreetingMessage(loop.state, 'executor', executorHello.output);
@@ -501,7 +503,6 @@ export async function runGreetingSession(
     update(loop.state);
     if (checkStop()) return loop.state;
 
-    onLog('mentor', 'Acknowledging…');
     const mentorAck = await runTurn(loop.state.directory, 'mentor', loop.state.mentor, GREETING_PROMPTS.mentorFinish(executorHello.output), turnCallbacks('mentor'));
     loop.state = applyTurnResult(loop.state, 'mentor', mentorAck);
     loop.state = addMessage(loop.state, { from: 'mentor', to: 'executor', type: 'greeting', content: mentorAck.output });
@@ -520,7 +521,6 @@ export async function runGreetingSession(
     if (callbacks.shouldStop()) {
       loop.state = setPairStatus(loop.state, 'paused', 'Stopped by user during turn');
     } else {
-      onError(msg);
       loop.state = setPairStatus(loop.state, 'error', msg);
     }
     update(loop.state);

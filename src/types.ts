@@ -40,7 +40,7 @@ export interface Message {
   id: string;
   timestamp: number;
   from: MessageSender;
-  to: string;
+  to: MessageSender;
   type: MessageType;
   content: string;
   iteration: number;

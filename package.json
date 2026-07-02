@@ -1,6 +1,6 @@
 {
   "name": "pair-code",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Terminal edition of The Pair: two AI coding agents collaborate on your code through the Claude Agent SDK",
   "type": "module",
   "license": "Apache-2.0",
