@@ -1,5 +1,6 @@
 import type { Profile, ResolvedProfile } from './types.js';
 import { readConfig, writeConfig, type PairConfig } from './config.js';
+import { humanizeProfileName, humanizeModelId, inferTier } from './ui.js';
 
 /**
  * Profiles come from three sources, in precedence order:
@@ -140,11 +141,18 @@ export function loadProfiles(): Profile[] {
     // check, so a malformed PAIR_PROFILE_<NAME>_BASE_URL would surface later
     // as an opaque request failure. Skip the profile and warn instead.
     if (baseUrl) {
+      let url: URL;
       try {
-        new URL(baseUrl);
+        url = new URL(baseUrl);
       } catch {
         process.stderr.write(`pair-code: skipping profile "${raw.toLowerCase()}": invalid base URL "${baseUrl}"\n`);
         continue;
+      }
+      // Warn (but don't block) on insecure http:// endpoints. The interactive
+      // EndpointForm flags these; env profiles bypass that form, so surface the
+      // risk here. Localhost loopback is exempt (local dev proxies).
+      if (url.protocol === 'http:' && url.hostname !== 'localhost' && url.hostname !== '127.0.0.1' && url.hostname !== '::1') {
+        process.stderr.write(`pair-code: warning: profile "${raw.toLowerCase()}" uses an insecure http:// base URL "${baseUrl}"\n`);
       }
     }
     profiles.push({
@@ -261,8 +269,12 @@ export function profileEnv(resolved: ResolvedProfile): Record<string, string> {
   return env;
 }
 
-export function profileLabel(name: string): string {
-  return loadProfiles().find(p => p.name === name)?.label ?? humanizeProfileName(name);
+export function profileLabel(name: string, profiles?: Profile[]): string {
+  // Accept an optional pre-loaded list so callers that already hold the merged
+  // profiles (e.g. a cached loadProfiles() result) don't re-scan env + disk on
+  // every label lookup.
+  const list = profiles ?? loadProfiles();
+  return list.find(p => p.name === name)?.label ?? humanizeProfileName(name);
 }
 
 // ── Model suggestions ───────────────────────────────────────────────────
@@ -300,75 +312,4 @@ export function suggestModels(profileName: string, defaultModel?: string): Model
     if (s.match.test(profileName)) s.models.forEach(push);
   }
   return out;
-}
-
-// ── Display helpers ─────────────────────────────────────────────────────
-
-function humanizeProfileName(raw: string): string {
-  const lower = raw.toLowerCase();
-  for (const brand in KNOWN_BRANDS) {
-    if (!lower.startsWith(brand)) continue;
-    const rest = lower.slice(brand.length);
-    // Bare brand → just the brand label.
-    if (!rest) return KNOWN_BRANDS[brand];
-    // Brand + separated suffix (e.g. 'anthropic-eu') → keep the suffix so labels
-    // stay unique (e.g. 'Anthropic (eu)'). A run-on like 'anthropicfoo' isn't a
-    // clean brand match, so fall through to default titlecasing instead.
-    const suffix = rest.replace(/^[-_.]+/, '');
-    if (suffix.length < rest.length) return `${KNOWN_BRANDS[brand]} (${suffix})`;
-    break;
-  }
-  return raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase();
-}
-
-function inferTier(id: string): ModelOption['tier'] {
-  const lower = id.toLowerCase();
-  if (/\b(opus|pro|max|flagship|ultra|m2|reasoner)\b/.test(lower)) return 'flagship';
-  if (/\b(haiku|mini|flash|nano|fast|small|light|air)\b/.test(lower)) return 'fast';
-  if (/\b(free|tiny)\b/.test(lower)) return 'light';
-  return 'standard';
-}
-
-const KNOWN_BRANDS: Record<string, string> = {
-  gpt: 'GPT',
-  glm: 'GLM',
-  llama: 'Llama',
-  qwen: 'Qwen',
-  kimi: 'Kimi',
-  gemini: 'Gemini',
-  gemma: 'Gemma',
-  claude: 'Claude',
-  anthropic: 'Anthropic',
-  grok: 'Grok',
-  deepseek: 'DeepSeek',
-  minimax: 'MiniMax',
-  moonshot: 'Moonshot',
-  openrouter: 'OpenRouter',
-  zhipu: 'Zhipu',
-};
-
-const ACRONYMS = new Set(['gpt', 'glm', 'llm', 'tts', 'stt', 'ocr', 'ai']);
-
-function formatSegment(part: string): string {
-  const lower = part.toLowerCase();
-  if (ACRONYMS.has(lower)) return lower.toUpperCase();
-  for (const brand in KNOWN_BRANDS) {
-    if (lower.startsWith(brand)) return KNOWN_BRANDS[brand] + part.slice(brand.length);
-  }
-  if (/^\d/.test(part)) return part;
-  return part.charAt(0).toUpperCase() + part.slice(1);
-}
-
-export function humanizeModelId(id: string): string {
-  const last = id.split('/').pop() ?? id;
-  const parts = last.split('-');
-  const out: string[] = [];
-  for (const part of parts) {
-    if (/^\d+$/.test(part) && out.length > 0 && /^[\d.]+$/.test(out[out.length - 1])) {
-      out[out.length - 1] = out[out.length - 1] + '.' + part;
-      continue;
-    }
-    out.push(formatSegment(part));
-  }
-  return out.join(' ');
 }

@@ -45,14 +45,16 @@ Keep these boundaries — they're load-bearing:
 
 - `index.ts` — CLI entry; parses argv and renders the Ink `<App>` (also the `providers` subcommand + `--help`/`--version`)
 - `process.ts` — pair engine: `runTurn()` wraps one SDK `query()`; `runPairEngine()` runs the mentor→executor→mentor loop
+- `prompts.ts` — prompt templates (`MENTOR_APPEND`, `EXECUTOR_APPEND`, `HANDOFF_PROMPTS`, `GREETING_PROMPTS`) extracted from `process.ts`
 - `providers.ts` — profile resolution across env + session + saved (`loadProfiles`/`resolveProfile`/`profileEnv`/`addEndpoint`/`persistProfile`/`forgetProfile`) + model suggestions
 - `config.ts` — the on-disk config: `readConfig`/`writeConfig`/`configPath` (atomic write, `0600`). Pure I/O — no profile/merge logic (that's `providers.ts`), no React
 - `state.ts` — `PairState` mutations only (no rendering, no I/O beyond `git status`)
 - `types.ts` — shared types and unions (`Profile`, `AgentRuntime`, `ToolEvent`, `PairStatus`, …). No CLI `ProviderKind`.
-- `ui.ts` — theme tokens (colour hexes, icons, formatters). No rendering, no state.
+- `ui.ts` — theme tokens (colour hexes, icons, formatters) + display helpers (`humanizeModelId`, `humanizeProfileName`, `inferTier`). No rendering, no state.
+- `verdict.ts` — verdict JSON parsing domain logic (`parseVerdict`, `stripVerdictBlocks`, `extractJsonBlocks`) extracted from `components.tsx`
 - `app.tsx` — Ink root: setup wizard (spec → per-role profile/model), session view, slash-command dispatch
-- `components.tsx` — presentational Ink components (Banner, StatusBar, AgentBar, MessageView, LiveTurn, ResultPanel, verdict chip)
-- `inputs.tsx` — interactive Ink inputs (`Select`, `SearchSelect`, `TextPrompt`, `SlashInput`) + fuzzy match
+- `components.tsx` — presentational Ink components (Banner, StatusBar, AgentBar, MessageView, LiveTurn, ResultPanel, verdict chip, ErrorBoundary)
+- `inputs.tsx` — interactive Ink inputs (`Select`, `SearchSelect`, `TextPrompt`, `SlashInput`) + `useTextInput` hook + fuzzy match
 - `useEngine.ts` — bridges the engine's imperative callbacks to React state (live streaming buffers, throttled)
 
 Don't mix concerns: no state mutation in components, no rendering in `state.ts`, no React in `process.ts`/`providers.ts`/`state.ts`/`config.ts`.

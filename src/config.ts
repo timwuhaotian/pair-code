@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import { join, basename } from 'node:path';
-import { mkdirSync, readFileSync, writeFileSync, renameSync, chmodSync, existsSync, readdirSync, unlinkSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, chmodSync, readdirSync, unlinkSync, statSync, openSync, closeSync, constants } from 'node:fs';
 
 /**
  * Opt-in on-disk config. Unlike env/session profiles (process memory only),
@@ -56,25 +56,51 @@ export function configPath(): string {
  */
 export function readConfig(): PairConfig {
   const path = configPath();
-  if (!existsSync(path)) return { version: CONFIG_VERSION, profiles: {} };
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf-8');
+  } catch (err) {
+    if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { version: CONFIG_VERSION, profiles: {} };
+    }
+    throw err;
+  }
 
   let parsed: Partial<PairConfig>;
   try {
-    parsed = JSON.parse(readFileSync(path, 'utf-8')) as Partial<PairConfig>;
+    parsed = JSON.parse(raw) as Partial<PairConfig>;
   } catch (err) {
     throw new CorruptConfigError(path, err);
   }
+
+  return migrateConfig(parsed, path);
+}
+
+/**
+ * Bring an on-disk config up to CONFIG_VERSION. Each case in the switch applies
+ * one version's transformation and bumps the version; the default fails closed
+ * for any version we don't know how to migrate — including files written by a
+ * newer pair-code — so we never silently downgrade or pass through an unknown
+ * schema that may hold secrets in a shape we don't understand.
+ */
+function migrateConfig(parsed: Partial<PairConfig>, path: string): PairConfig {
   const version = typeof parsed.version === 'number' ? parsed.version : CONFIG_VERSION;
-  // TODO: future migrations live here — bump CONFIG_VERSION and add a step that
-  // transforms the prior shape into the current one before returning. For now we
-  // only preserve the on-disk version and warn if it differs from what we expect.
-  if (version !== CONFIG_VERSION) {
-    process.stderr.write(`pair-code: config version ${version} differs from expected ${CONFIG_VERSION}\n`);
+  const profiles = sanitiseProfiles(parsed.profiles);
+
+  if (version === CONFIG_VERSION) {
+    return { version: CONFIG_VERSION, profiles };
   }
-  return {
-    version,
-    profiles: sanitiseProfiles(parsed.profiles),
-  };
+
+  switch (version) {
+    // Add cases here as the schema evolves. Each case transforms the prior
+    // shape and re-enters migrateConfig to apply the next migration, e.g.:
+    // case 1:
+    //   return migrateConfig({ version: 2, profiles: migrateV1ToV2(profiles) }, path);
+    default:
+      throw new Error(
+        `config version ${version} at ${path} cannot be migrated to ${CONFIG_VERSION}; refusing to load`,
+      );
+  }
 }
 
 /**
@@ -110,8 +136,25 @@ export function writeConfig(config: PairConfig): void {
   } catch {}
   const tmp = `${path}.tmp-${process.pid}`;
   const data = JSON.stringify({ ...config, version: CONFIG_VERSION }, null, 2);
-  writeFileSync(tmp, data, { mode: 0o600 });
-  chmodSync(tmp, 0o600); // writeFileSync ignores mode if tmp already existed
+  // O_EXCL refuses to create the file if it already exists or is a symlink,
+  // preventing an attacker from pre-placing a symlink that would let them
+  // intercept or replace the written secrets.
+  let fd: number;
+  try {
+    fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+      try { unlinkSync(tmp); } catch {}
+      fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    } else {
+      throw err;
+    }
+  }
+  try {
+    writeFileSync(fd, data);
+  } finally {
+    closeSync(fd);
+  }
   renameSync(tmp, path);
 }
 

@@ -2,6 +2,7 @@ import { query, type Query, type Options } from '@anthropic-ai/claude-agent-sdk'
 import type { PairState, AgentRuntime, ToolEvent, TokenUsage, ActivityPhase } from './types.js';
 import { resolveProfile, profileEnv } from './providers.js';
 import { addMessage, hasFinishSignal, setPairStatus, updateActivity, getConversationHistory, getGitChanges, prepareRun, getTaskSpec, initializeGreetingState, addGreetingMessage, isGreetingComplete } from './state.js';
+import { MENTOR_APPEND, EXECUTOR_APPEND, HANDOFF_PROMPTS, GREETING_PROMPTS } from './prompts.js';
 
 const TURN_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes per turn
 const EMPTY_OUTPUT = '(No textual output produced)';
@@ -14,9 +15,55 @@ const EMPTY_OUTPUT = '(No textual output produced)';
 const READ_ONLY_TOOLS = ['Read', 'Grep', 'Glob'];
 const NON_READ_TOOLS = ['Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Bash', 'BashOutput', 'KillShell', 'WebFetch', 'WebSearch', 'TodoWrite', 'Task', 'Skill'];
 
+// ── Retry / error helpers ────────────────────────────────────────────────
+
+const MAX_RETRIES = 2; // max 2 retries → 3 total attempts per turn
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** True for recoverable SDK failures (rate-limit, timeout, network). */
+function isTransientError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return /(rate ?limit|exhausted|429|throttl|overload|timeout|timed out|etimedout|network|econnreset|econnrefused|enotfound|fetch failed|socket hang up|epipe)/.test(msg);
+}
+
+/** True for permanent failures that should never be retried (auth, invalid model). */
+function isPermanentError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return /(auth|unauthor|invalid api key|credential|401|403|invalid model|model not found|does not exist)/.test(msg);
+}
+
+/** True for stale / expired resume-session errors. */
+function isStaleSessionError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return /session.*(not found|expired|invalid|stale)|(not found|expired|invalid|stale).*session|resume.*(fail|error|invalid|not found)/.test(msg);
+}
+
+/** Attach token usage to a thrown error so callers can still accumulate cost. */
+interface ErrorWithTokenUsage extends Error {
+  tokenUsage?: TokenUsage;
+}
+
+function attachTokenUsage(err: Error, tu: TokenUsage): void {
+  (err as ErrorWithTokenUsage).tokenUsage = tu;
+}
+
+function getTokenUsage(err: unknown): TokenUsage | undefined {
+  return err instanceof Error ? (err as ErrorWithTokenUsage).tokenUsage : undefined;
+}
+
+/** Redact common API-key / bearer-token patterns from a string. */
+function redactSecrets(text: string): string {
+  return text
+    .replace(/sk-[A-Za-z0-9_\-]+/g, 'sk-[REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9_\-\.]+/gi, 'Bearer [REDACTED]');
+}
+
 // ── Streaming primitives ────────────────────────────────────────────────
 
-export interface TurnCallbacks {
+interface TurnCallbacks {
   onTextDelta: (text: string) => void;
   onToolStart: (ev: ToolEvent) => void;
   onToolEnd: (id: string, status: 'done' | 'error') => void;
@@ -24,7 +71,7 @@ export interface TurnCallbacks {
   onActivity: (phase: ActivityPhase, label: string) => void;
 }
 
-export interface TurnResult {
+interface TurnResult {
   output: string;
   sessionId?: string;
   tokenUsage?: TokenUsage;
@@ -57,7 +104,7 @@ function toolTarget(input: unknown): string | undefined {
   return undefined;
 }
 
-export async function runTurn(
+async function runTurn(
   directory: string,
   role: 'mentor' | 'executor',
   runtime: AgentRuntime,
@@ -70,38 +117,6 @@ export async function runTurn(
   }
 
   const isMentor = role === 'mentor';
-  const controller = new AbortController();
-
-  const options: Options = {
-    cwd: directory,
-    model: runtime.model,
-    env: profileEnv(resolved),
-    resume: runtime.sessionId,
-    includePartialMessages: true,
-    // The executor runs with full tool access and bypassed permissions (it
-    // writes code). The mentor is read-only: `tools` restricts its available
-    // set to Read/Grep/Glob (the primary enforcement), with `disallowedTools`
-    // as defense-in-depth. Because the mentor only has safe read tools, it
-    // does not need bypassPermissions or allowDangerouslySkipPermissions.
-    permissionMode: isMentor ? undefined : 'bypassPermissions',
-    allowDangerouslySkipPermissions: isMentor ? undefined : true,
-    abortController: controller,
-    tools: isMentor ? READ_ONLY_TOOLS : { type: 'preset', preset: 'claude_code' },
-    allowedTools: isMentor ? READ_ONLY_TOOLS : undefined,
-    disallowedTools: isMentor ? NON_READ_TOOLS : undefined,
-    systemPrompt: {
-      type: 'preset',
-      preset: 'claude_code',
-      append: isMentor ? MENTOR_APPEND : EXECUTOR_APPEND,
-    },
-    stderr: (data: string) => {
-      const line = data.trim();
-      if (!line) return;
-      const lower = line.toLowerCase();
-      if (/(rate ?limit|exhausted|429|throttl|overload)/.test(lower)) cbs.onActivity('thinking', 'Throttled — waiting');
-      else if (/(auth|unauthor|invalid api key|credential)/.test(lower)) cbs.onActivity('thinking', 'Auth issue');
-    },
-  };
 
   // Accumulate streamed text in an array and join once at the end — avoids
   // O(n²) string concatenation on very long responses.
@@ -112,80 +127,185 @@ export async function runTurn(
   let firstToken = true;
 
   let timedOut = false;
+  const controller = new AbortController();
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort();
     killActiveTurn();
   }, TURN_TIMEOUT_MS);
 
-  const q = query({ prompt: message, options });
-  activeQuery = q;
+  // P1 #8: bounded retry for transient SDK failures (max 2 retries = 3 total
+  // attempts). P2 #27: a stale/expired resume sessionId is cleared and the
+  // turn retried once without resume (not counted against the retry budget).
+  let attempt = 0;
+  let staleSessionRetried = false;
 
+  // P2 #26: the timer is cleared in this outer finally so a sync throw from
+  // query() still releases it.
   try {
-    for await (const msg of q) {
-      if (msg.type === 'system' && msg.subtype === 'init') {
-        sessionId = msg.session_id;
-        cbs.onSessionId(sessionId);
-        cbs.onActivity('thinking', 'Analyzing');
-        continue;
-      }
+    retry: while (true) {
+      // Reset per-attempt streaming state (tokenUsage persists — it carries
+      // cost from whichever attempt got furthest, for P2 #17).
+      textChunks.length = 0;
+      finalText = '';
+      firstToken = true;
 
-      if (msg.type === 'stream_event') {
-        const ev = msg.event;
-        if (ev.type === 'content_block_delta' && ev.delta.type === 'text_delta' && ev.delta.text) {
-          if (firstToken) { cbs.onActivity('responding', 'Writing'); firstToken = false; }
-          textChunks.push(ev.delta.text);
-          cbs.onTextDelta(ev.delta.text);
-        }
-        continue;
-      }
-
-      if (msg.type === 'assistant') {
-        for (const b of msg.message.content) {
-          if (b.type === 'tool_use') {
-            cbs.onActivity('using_tools', b.name);
-            cbs.onToolStart({ id: b.id, name: b.name, target: toolTarget(b.input), status: 'running' });
-          }
-        }
-        continue;
-      }
-
-      if (msg.type === 'user') {
-        const content = msg.message.content;
-        const blocks = typeof content === 'string' ? [] : content;
-        for (const b of blocks) {
-          if (b.type === 'tool_result') {
-            cbs.onToolEnd(b.tool_use_id, b.is_error ? 'error' : 'done');
-          }
-        }
-        continue;
-      }
-
-      if (msg.type === 'result') {
-        sessionId = msg.session_id;
-        tokenUsage = {
-          outputTokens: msg.usage.output_tokens,
-          inputTokens: msg.usage.input_tokens,
-          costUsd: msg.total_cost_usd,
+      try {
+        const options: Options = {
+          cwd: directory,
+          model: runtime.model,
+          env: profileEnv(resolved),
+          resume: sessionId,
+          includePartialMessages: true,
+          // The executor runs with full tool access and bypassed permissions (it
+          // writes code). The mentor is read-only: `tools` restricts its available
+          // set to Read/Grep/Glob (the primary enforcement), with `disallowedTools`
+          // as defense-in-depth. Because the mentor only has safe read tools, it
+          // does not need bypassPermissions or allowDangerouslySkipPermissions.
+          permissionMode: isMentor ? undefined : 'bypassPermissions',
+          allowDangerouslySkipPermissions: isMentor ? undefined : true,
+          abortController: controller,
+          tools: isMentor ? READ_ONLY_TOOLS : { type: 'preset', preset: 'claude_code' },
+          allowedTools: isMentor ? READ_ONLY_TOOLS : undefined,
+          disallowedTools: isMentor ? NON_READ_TOOLS : undefined,
+          systemPrompt: {
+            type: 'preset',
+            preset: 'claude_code',
+            append: isMentor ? MENTOR_APPEND : EXECUTOR_APPEND,
+          },
+          stderr: (data: string) => {
+            const line = data.trim();
+            if (!line) return;
+            const lower = line.toLowerCase();
+            if (/(rate ?limit|exhausted|429|throttl|overload)/.test(lower)) cbs.onActivity('thinking', 'Throttled — waiting');
+            else if (/(auth|unauthor|invalid api key|credential)/.test(lower)) cbs.onActivity('thinking', 'Auth issue');
+          },
         };
-        if (msg.subtype === 'success') {
-          finalText = msg.result;
-        } else {
-          const detail = msg.errors.length ? msg.errors.join('; ') : msg.subtype;
-          throw new Error(`${role} agent ended with ${msg.subtype}: ${detail}`);
+
+        // P2 #26: query() sits inside the try so a sync throw still reaches
+        // the finally that clears the timer.
+        const q = query({ prompt: message, options });
+        activeQuery = q;
+
+        try {
+          for await (const msg of q) {
+            if (msg.type === 'system' && msg.subtype === 'init') {
+              sessionId = msg.session_id;
+              cbs.onSessionId(sessionId);
+              cbs.onActivity('thinking', 'Analyzing');
+              continue;
+            }
+
+            if (msg.type === 'stream_event') {
+              const ev = msg.event;
+              if (ev.type === 'content_block_delta' && ev.delta.type === 'text_delta' && ev.delta.text) {
+                if (firstToken) { cbs.onActivity('responding', 'Writing'); firstToken = false; }
+                textChunks.push(ev.delta.text);
+                cbs.onTextDelta(ev.delta.text);
+              }
+              continue;
+            }
+
+            if (msg.type === 'assistant') {
+              // P1 #2: apply the same string-type guard as the user handler.
+              const content = msg.message.content;
+              const blocks = typeof content === 'string' ? [] : content;
+              for (const b of blocks) {
+                if (b.type === 'tool_use') {
+                  cbs.onActivity('using_tools', b.name);
+                  cbs.onToolStart({ id: b.id, name: b.name, target: toolTarget(b.input), status: 'running' });
+                }
+              }
+              continue;
+            }
+
+            if (msg.type === 'user') {
+              const content = msg.message.content;
+              const blocks = typeof content === 'string' ? [] : content;
+              for (const b of blocks) {
+                if (b.type === 'tool_result') {
+                  cbs.onToolEnd(b.tool_use_id, b.is_error ? 'error' : 'done');
+                }
+              }
+              continue;
+            }
+
+            if (msg.type === 'result') {
+              sessionId = msg.session_id;
+              if (msg.subtype === 'success') {
+                // P1 #2: guard usage with optional chaining; read result with ?? ''.
+                tokenUsage = {
+                  outputTokens: msg.usage?.output_tokens ?? 0,
+                  inputTokens: msg.usage?.input_tokens,
+                  costUsd: msg.total_cost_usd,
+                };
+                finalText = msg.result ?? '';
+              } else {
+                // P1 #2: guard errors with optional chaining; P3 #43: redact.
+                const detail = msg.errors?.length ? msg.errors.join('; ') : msg.subtype;
+                const err = new Error(redactSecrets(`${role} agent ended with ${msg.subtype}: ${detail}`));
+                // P2 #17: attach tokenUsage so the caller can accumulate cost.
+                if (tokenUsage) attachTokenUsage(err, tokenUsage);
+                throw err;
+              }
+            }
+          }
+        } finally {
+          if (activeQuery === q) activeQuery = null;
         }
+
+        // Success — exit the retry loop.
+        break retry;
+      } catch (err) {
+        // P2 #17: attach tokenUsage so the caller can accumulate cost even on
+        // failed turns.
+        if (tokenUsage && err instanceof Error && !getTokenUsage(err)) {
+          attachTokenUsage(err, tokenUsage);
+        }
+
+        // Don't retry after the 10-minute turn timeout — the controller is
+        // already aborted and a retry would fail immediately.
+        if (timedOut) {
+          if (err instanceof Error) err.message = redactSecrets(err.message);
+          throw err;
+        }
+
+        // P2 #27: stale / expired resume sessionId — clear it and retry once
+        // without resume (not counted against the retry budget).
+        if (!staleSessionRetried && isStaleSessionError(err)) {
+          staleSessionRetried = true;
+          sessionId = undefined;
+          continue retry;
+        }
+
+        // P1 #8: retry transient (non-permanent) errors with exponential
+        // backoff.
+        if (attempt < MAX_RETRIES && !isPermanentError(err) && isTransientError(err)) {
+          attempt++;
+          const backoffMs = 2 ** attempt * 1000; // 2s, 4s
+          const errMsg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(`[${role}] transient error (attempt ${attempt}/${MAX_RETRIES + 1}), retrying in ${backoffMs}ms: ${errMsg}\n`);
+          await sleep(backoffMs);
+          continue retry;
+        }
+
+        // Permanent error or retries exhausted — redact and throw.
+        if (err instanceof Error) err.message = redactSecrets(err.message);
+        throw err;
       }
     }
   } finally {
     clearTimeout(timer);
-    if (activeQuery === q) activeQuery = null;
   }
 
   if (controller.signal.aborted && !finalText) {
     // A timeout-driven abort and a user-stop abort look identical on the
     // signal; the timedOut flag lets us surface the real cause so the error
     // panel doesn't show a misleading "/model" hint for a 10-minute timeout.
-    throw new Error(timedOut ? `${role} turn timed out after 10 minutes` : `${role} turn aborted`);
+    const err = new Error(timedOut ? `${role} turn timed out after 10 minutes` : `${role} turn aborted`);
+    // P2 #17: attach tokenUsage so the caller can accumulate cost.
+    if (tokenUsage) attachTokenUsage(err, tokenUsage);
+    throw err;
   }
 
   return {
@@ -194,51 +314,6 @@ export async function runTurn(
     tokenUsage,
   };
 }
-
-// ── Handoff prompts ─────────────────────────────────────────────────────
-
-const MENTOR_APPEND =
-  'You are the MENTOR in a pair-programming loop: you PLAN and REVIEW, you never write code. ' +
-  'You are running in READ-ONLY mode — you may use Read, Grep and Glob to inspect the repository and verify claims, but you have no write or shell tools. ' +
-  'Be precise and demanding about correctness.';
-
-const EXECUTOR_APPEND =
-  'You are the EXECUTOR in a pair-programming loop: you implement the mentor\'s plan with full tool access. ' +
-  'After making changes, verify them yourself (build / typecheck / tests as appropriate) and include the relevant command output as evidence in your hand-off, because the mentor reviews statically and cannot run commands. ' +
-  'Never emit the token TASK_COMPLETE — only the mentor may end the session.';
-
-const HANDOFF_PROMPTS = {
-  initialMentor: (spec: string) =>
-    `## Task\n${spec}\n\nCreate a detailed, actionable plan for the executor. Include: analysis of the task, a step-by-step implementation plan, files to create/modify, and key risks. You may Read/Grep/Glob the repo first to ground the plan. Do NOT emit TASK_COMPLETE in this planning turn.`,
-
-  mentorToExecutor: (plan: string, spec: string) =>
-    `## Task\n${spec}\n\n## Mentor's Plan\n${plan}\n\nExecute the plan. Make all necessary code changes, then verify them (build/typecheck/tests) and report what you changed plus the verification output. Do NOT emit TASK_COMPLETE — only the mentor can finish.`,
-
-  executorToMentor: (executorResult: string, spec: string, history: string) =>
-    `## Task\n${spec}\n\n## Conversation History\n${history}\n\n## Executor's Latest Work (with its own verification evidence)\n${executorResult}\n\nReview the work read-only. Use Read/Grep/Glob to independently confirm the changes and the evidence — do not trust the self-report blindly. Check completeness, correctness, and quality.\n\nIf it fully satisfies the task, respond with TASK_COMPLETE on its own line. Otherwise explain precisely what must be fixed and hand back.\n\nAlways include a structured review:\n\`\`\`json\n{"verdict":"pass|fail","risk":"low|medium|high","confidence":0.0-1.0,"issues":[],"evidence":[],"reasoning":"...","summary":"...","nextStep":{"action":"continue|finish","instructions":[]}}\n\`\`\``,
-};
-
-// ── Greeting smoke-test prompts ─────────────────────────────────────────
-// A lightweight 3-turn script that exercises the pair loop (streaming, profile
-// resolution, per-role tool asymmetry, session continuity, timeout) without a
-// coding task. The mentor owns the finishing TASK_COMPLETE, preserving the
-// invariant in CLAUDE.md; the executor is reminded of the prohibition on its
-// turn (EXECUTOR_APPEND already forbids it).
-const GREETING_PROMPTS = {
-  mentorHello: () =>
-    `This is a greeting smoke-test of the pair loop — there is no coding task. ` +
-    `Briefly say hello to the executor and ask it to confirm it is ready (one or two sentences). ` +
-    `Do NOT plan, review, or write code. Do NOT emit TASK_COMPLETE.`,
-
-  executorHello: (mentorHello: string) =>
-    `## Mentor's greeting\n${mentorHello}\n\nThis is a greeting smoke-test — no coding task. ` +
-    `Briefly say hello back and confirm you are ready (one or two sentences). Do NOT write code. ` +
-    `Do NOT emit TASK_COMPLETE — only the mentor can finish.`,
-
-  mentorFinish: (executorHello: string) =>
-    `## Executor's greeting\n${executorHello}\n\nThe greeting exchange is complete. ` +
-    `Acknowledge in one sentence, then end the session by emitting TASK_COMPLETE on its own line.`,
-};
 
 // ── Engine loop ─────────────────────────────────────────────────────────
 
@@ -386,7 +461,7 @@ export async function runPairEngine(
       // No-progress guard: count consecutive executor turns that produced no
       // usable output (empty / EMPTY_OUTPUT) or repeated the prior turn verbatim.
       const trimmedOutput = executorResult.output.trim();
-      const noProgress = trimmedOutput === '' || trimmedOutput === EMPTY_OUTPUT || trimmedOutput === prevExecutorOutput;
+      const noProgress = trimmedOutput === EMPTY_OUTPUT || trimmedOutput === prevExecutorOutput;
       noProgressTurns = noProgress ? noProgressTurns + 1 : 0;
       prevExecutorOutput = trimmedOutput;
       if (noProgressTurns >= MAX_NO_PROGRESS_TURNS) {
@@ -434,7 +509,12 @@ export async function runPairEngine(
       }
     }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    // P3 #43: redact secrets; P2 #17: accumulate token usage from the failed turn.
+    const msg = redactSecrets(err instanceof Error ? err.message : String(err));
+    const tu = getTokenUsage(err);
+    if (tu) {
+      loop.state = { ...loop.state, totalCostUsd: loop.state.totalCostUsd + (tu.costUsd ?? 0) };
+    }
     if (callbacks.shouldStop()) {
       loop.state = setPairStatus(loop.state, 'paused', 'Stopped by user during turn');
     } else {
@@ -517,7 +597,12 @@ export async function runGreetingSession(
       update(loop.state);
     }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    // P3 #43: redact secrets; P2 #17: accumulate token usage from the failed turn.
+    const msg = redactSecrets(err instanceof Error ? err.message : String(err));
+    const tu = getTokenUsage(err);
+    if (tu) {
+      loop.state = { ...loop.state, totalCostUsd: loop.state.totalCostUsd + (tu.costUsd ?? 0) };
+    }
     if (callbacks.shouldStop()) {
       loop.state = setPairStatus(loop.state, 'paused', 'Stopped by user during turn');
     } else {

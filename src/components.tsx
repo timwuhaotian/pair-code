@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import type { JSX } from 'react';
+import { Component, memo, useEffect, useMemo, useRef, useState } from 'react';
+import type { JSX, ReactNode } from 'react';
 import { Box, Text, useStdout } from 'ink';
 import type { PairState, Message, ToolEvent, AgentRuntime, ActivityPhase } from './types.js';
 import { colors, icons, heroGradient, rgbHex, spinnerFrames, formatDuration, formatIterations, formatTokens, truncate } from './ui.js';
+import { parseVerdict, stripVerdictBlocks } from './verdict.js';
+import type { Verdict } from './verdict.js';
 
 // ── Spinner ─────────────────────────────────────────────────────────────
 
@@ -76,7 +78,8 @@ const LOGO_COMPACT = [
 ];
 
 export function Banner(): JSX.Element {
-  const wide = (process.stdout.columns ?? 80) >= 70;
+  const { stdout } = useStdout();
+  const wide = (stdout?.columns ?? 80) >= 70;
   const logo = wide ? LOGO_FULL : LOGO_COMPACT;
   return (
     <Box flexDirection="column" marginBottom={1}>
@@ -121,7 +124,7 @@ function formatUsd(n: number): string {
   return `$${n.toFixed(4)}`;
 }
 
-export function StatusBar({ state, elapsedMs }: { state: PairState; elapsedMs: number }): JSX.Element {
+export const StatusBar = memo(function StatusBar({ state, elapsedMs }: { state: PairState; elapsedMs: number }): JSX.Element {
   const { stdout } = useStdout();
   const cols = stdout?.columns ?? 80;
   const color = STATUS_COLOR[state.status] ?? colors.accent;
@@ -151,7 +154,7 @@ export function StatusBar({ state, elapsedMs }: { state: PairState; elapsedMs: n
       )}
     </Box>
   );
-}
+});
 
 const PHASE_LABEL: Record<ActivityPhase, string> = {
   idle: 'idle', thinking: 'thinking', using_tools: 'using tools', responding: 'writing',
@@ -192,16 +195,18 @@ const TOOL_VERB: Record<string, string> = {
 };
 
 export function ToolLine({ ev }: { ev: ToolEvent }): JSX.Element {
+  const { stdout } = useStdout();
   const verb = TOOL_VERB[ev.name] ?? ev.name;
   const running = ev.status === 'running';
   const color = ev.status === 'error' ? colors.error : ev.status === 'done' ? colors.success : colors.warn;
+  const targetMax = Math.min(56, Math.floor((stdout?.columns ?? 80) * 0.5));
   return (
     <Text>
       {running
         ? <><Spinner color={color} /><Text> </Text></>
         : <Text color={color}>{ev.status === 'error' ? icons.cross : icons.check} </Text>}
       <Text dimColor={!running} color={running ? color : undefined}>{verb}</Text>
-      {ev.target ? <Text dimColor> {truncate(ev.target, 56)}</Text> : null}
+      {ev.target ? <Text dimColor> {truncate(ev.target, targetMax)}</Text> : null}
     </Text>
   );
 }
@@ -217,88 +222,6 @@ function senderColor(from: string): string {
 }
 function senderIcon(from: string): string {
   return from === 'mentor' ? icons.mentor : from === 'executor' ? icons.executor : icons.human;
-}
-
-interface Verdict { verdict?: string; risk?: string; confidence?: number; summary?: string }
-
-/** Strip a single trailing comma before a closing } or ] so near-valid JSON parses. */
-function stripTrailingCommas(s: string): string {
-  return s.replace(/,(\s*[}\]])/g, '$1');
-}
-
-/** Try to parse a candidate JSON string into a verdict, tolerating trailing commas. */
-function toVerdict(raw: string): Verdict | null {
-  let o: Record<string, unknown>;
-  try {
-    o = JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    try {
-      o = JSON.parse(stripTrailingCommas(raw)) as Record<string, unknown>;
-    } catch {
-      return null;
-    }
-  }
-  if (!o || typeof o !== 'object') return null;
-  const verdict = typeof o.verdict === 'string' ? o.verdict.toLowerCase() : undefined;
-  const risk = typeof o.risk === 'string' ? o.risk.toLowerCase() : undefined;
-  if (!verdict && !risk) return null;
-  return {
-    verdict,
-    risk,
-    confidence: typeof o.confidence === 'number' ? o.confidence : undefined,
-    summary: typeof o.summary === 'string' ? o.summary : undefined,
-  };
-}
-
-/** Extract top-level {…} JSON spans via brace counting, handling nesting. */
-function extractJsonBlocks(text: string): string[] {
-  const blocks: string[] = [];
-  let depth = 0, start = -1;
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === '{') { if (depth === 0) start = i; depth++; }
-    else if (text[i] === '}') { depth--; if (depth === 0 && start >= 0) { blocks.push(text.slice(start, i + 1)); start = -1; } }
-  }
-  return blocks;
-}
-
-/**
- * Extract the verdict block from a mentor review. Scans every fenced code block
- * (```json, a bare ``` fence, or any language tag) and returns the first one
- * that parses into an object carrying a `verdict` or `risk` field — a leading
- * non-verdict json block no longer suppresses the chip. Falls back to
- * brace-matching the first {…} that parses when no fence yields a verdict.
- */
-function parseVerdict(content: string): Verdict | null {
-  for (const m of content.matchAll(/```[^\n]*\n([\s\S]*?)```/g)) {
-    const v = toVerdict(m[1].trim());
-    if (v) return v;
-  }
-  // No fenced verdict — try each top-level {…} span in document order.
-  for (const block of extractJsonBlocks(content)) {
-    const v = toVerdict(block);
-    if (v) return v;
-  }
-  return null;
-}
-
-/**
- * Remove every verdict-bearing block from the rendered body so the raw JSON
- * never leaks beside the chip. Globally strips any fenced block (tagged, bare,
- * or ```json) whose payload parses to a verdict, then any remaining {…} span
- * that does — mirroring what `parseVerdict` consumes. Non-verdict code fences
- * are left untouched.
- */
-function stripVerdictBlocks(content: string): string {
-  let out = content.replace(/```[^\n]*\n[\s\S]*?```/g, block => {
-    const inner = block.replace(/^```[^\n]*\n/, '').replace(/```$/, '');
-    return toVerdict(inner.trim()) ? '' : block;
-  });
-  // Remove top-level {…} spans that parse to a verdict. Brace-counting keeps
-  // nested objects intact; split/join removes every occurrence.
-  for (const block of extractJsonBlocks(out)) {
-    if (toVerdict(block)) out = out.split(block).join('');
-  }
-  return out.trim();
 }
 
 function VerdictChip({ v }: { v: Verdict }): JSX.Element {
@@ -361,7 +284,7 @@ export function LiveTurn({ role, subtitle, text, tools }: { role: 'mentor' | 'ex
   const color = role === 'mentor' ? colors.mentor : colors.executor;
   // Reset the clock each time the turn changes hands (role flips per turn).
   const elapsed = useElapsed(role);
-  const tail = text.split('\n').slice(-14);
+  const tail = useMemo(() => text.split('\n').slice(-14), [text]);
   const recentTools = tools.slice(-6);
   const runningCount = tools.filter(t => t.status === 'running').length;
   return (
@@ -422,7 +345,7 @@ function truncateError(msg: string, maxLines = 5, maxChars = 500): string {
   return (lines.length > maxLines || clipped) ? `${out}${icons.ellipsis}` : out;
 }
 
-export function ResultPanel({ state }: { state: PairState }): JSX.Element {
+export const ResultPanel = memo(function ResultPanel({ state }: { state: PairState }): JSX.Element {
   if (state.status === 'finished') {
     const dur = state.finishedAt && state.createdAt ? formatDuration(state.finishedAt - state.createdAt) : '—';
     const totalTokens = (state.mentor.tokenUsage?.outputTokens ?? 0) + (state.executor.tokenUsage?.outputTokens ?? 0);
@@ -462,4 +385,41 @@ export function ResultPanel({ state }: { state: PairState }): JSX.Element {
     );
   }
   return <Text> </Text>;
+});
+
+// ── Error boundary ──────────────────────────────────────────────────────
+// Catches render-time errors inside the Ink tree so a broken component shows
+// a readable message instead of an opaque raw-mode / React stack crash.
+
+interface ErrorBoundaryProps {
+  children: ReactNode;
+}
+
+interface ErrorBoundaryState {
+  error: Error | null;
+}
+
+export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(): void {
+    // Give Ink a tick to paint the fallback UI, then exit non-zero.
+    setTimeout(() => process.exit(1), 100);
+  }
+
+  render(): ReactNode {
+    if (this.state.error) {
+      return (
+        <Box flexDirection="column">
+          <Text color="red">Something went wrong: {this.state.error.message}</Text>
+          <Text dimColor>Please restart the app.</Text>
+        </Box>
+      );
+    }
+    return this.props.children;
+  }
 }

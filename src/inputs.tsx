@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import type { JSX } from 'react';
 import { Box, Text, useInput } from 'ink';
+import type { Key } from 'ink';
 import { colors, icons } from './ui.js';
 
 // ── Fuzzy match ─────────────────────────────────────────────────────────
@@ -45,6 +46,96 @@ function withCursor(text: string, cursor: number, color: string): JSX.Element {
   );
 }
 
+// ── Text input hook ─────────────────────────────────────────────────────
+
+// Result of handleEditKey: 'edit' means the buffer was modified, 'move' means
+// only the cursor position changed, false means the key was not recognised.
+type EditResult = 'edit' | 'move' | false;
+
+// Encapsulates buffer + cursor state and the common keyboard handlers shared
+// by SearchSelect, TextPrompt, and SlashInput: arrow keys, Ctrl+A/E/U/K,
+// backspace, delete, and printable character insertion. The `onChange` callback
+// fires whenever the buffer is modified so callers can reset dependent state
+// (selection index, hint flag, etc.). Buffer and cursor are held in a single
+// state object and updated atomically inside functional updaters so the cursor
+// always sees the latest buffer — no stale closure values.
+function useTextInput(initial: string, onChange?: () => void): {
+  buffer: string;
+  cursor: number;
+  set: (buffer: string, cursor?: number) => void;
+  reset: () => void;
+  handleEditKey: (input: string, key: Key) => EditResult;
+} {
+  const [state, setState] = useState<{ buffer: string; cursor: number }>({
+    buffer: initial,
+    cursor: initial.length,
+  });
+
+  const handleEditKey = (input: string, key: Key): EditResult => {
+    if (key.leftArrow) {
+      setState(s => ({ ...s, cursor: Math.max(0, s.cursor - 1) }));
+      return 'move';
+    }
+    if (key.rightArrow) {
+      setState(s => ({ ...s, cursor: Math.min(s.buffer.length, s.cursor + 1) }));
+      return 'move';
+    }
+    if (key.ctrl && input === 'a') {
+      setState(s => ({ ...s, cursor: 0 }));
+      return 'move';
+    }
+    if (key.ctrl && input === 'e') {
+      setState(s => ({ ...s, cursor: s.buffer.length }));
+      return 'move';
+    }
+    if (key.ctrl && input === 'u') {
+      setState(s => ({ buffer: s.buffer.slice(s.cursor), cursor: 0 }));
+      onChange?.();
+      return 'edit';
+    }
+    if (key.ctrl && input === 'k') {
+      setState(s => ({ buffer: s.buffer.slice(0, s.cursor), cursor: s.cursor }));
+      onChange?.();
+      return 'edit';
+    }
+    if (key.backspace) {
+      setState(s => {
+        const c = Math.max(0, Math.min(s.cursor, s.buffer.length));
+        return { buffer: s.buffer.slice(0, Math.max(0, c - 1)) + s.buffer.slice(c), cursor: Math.max(0, c - 1) };
+      });
+      onChange?.();
+      return 'edit';
+    }
+    if (key.delete) {
+      setState(s => {
+        const c = Math.max(0, Math.min(s.cursor, s.buffer.length));
+        return { buffer: s.buffer.slice(0, c) + s.buffer.slice(c + 1), cursor: c };
+      });
+      onChange?.();
+      return 'edit';
+    }
+    if (input && !key.ctrl && !key.meta) {
+      setState(s => {
+        const c = Math.max(0, Math.min(s.cursor, s.buffer.length));
+        return { buffer: s.buffer.slice(0, c) + input + s.buffer.slice(c), cursor: c + input.length };
+      });
+      onChange?.();
+      return 'edit';
+    }
+    return false;
+  };
+
+  const set = (buffer: string, cursor?: number) => {
+    setState({ buffer, cursor: cursor ?? buffer.length });
+  };
+
+  const reset = () => setState({ buffer: '', cursor: 0 });
+
+  const cursor = Math.max(0, Math.min(state.cursor, state.buffer.length));
+
+  return { buffer: state.buffer, cursor, set, reset, handleEditKey };
+}
+
 // ── Select ──────────────────────────────────────────────────────────────
 
 export interface SelectItem<T> { label: string; value: T; hint?: string }
@@ -67,6 +158,10 @@ export function Select<T>(props: {
   useInput((_input, key) => {
     if (key.upArrow) setIndex(i => Math.max(0, i - 1));
     else if (key.downArrow) setIndex(i => Math.min(props.items.length - 1, i + 1));
+    else if (key.home) setIndex(0);
+    else if (key.end) setIndex(Math.max(0, props.items.length - 1));
+    else if (key.pageUp) setIndex(i => Math.max(0, i - maxVisible));
+    else if (key.pageDown) setIndex(i => Math.min(props.items.length - 1, i + maxVisible));
     else if (key.return) { const item = props.items[clampedIndex]; if (item) props.onSubmit(item.value); }
     else if (key.escape && props.onCancel) props.onCancel();
   });
@@ -108,39 +203,38 @@ export function SearchSelect<T>(props: {
   onSubmit: (value: T) => void;
   onCancel?: () => void;
 }): JSX.Element {
-  const [query, setQuery] = useState('');
-  const [cursor, setCursor] = useState(0);
   const [index, setIndex] = useState(0);
   const [hint, setHint] = useState(false);
   const maxVisible = props.maxVisible ?? 8;
 
-  const matches = props.items
-    .map(item => {
-      if (!query) return { item, score: 0 };
-      const hay = `${item.label} ${item.meta ?? ''} ${item.keywords ?? ''}`;
-      const m = fuzzyMatch(query, hay);
-      return m.matched ? { item, score: m.score } : null;
-    })
-    .filter((x): x is { item: SearchItem<T>; score: number } => x !== null)
-    .sort((a, b) => b.score - a.score);
+  const { buffer: query, cursor: cur, handleEditKey, reset } = useTextInput('', () => {
+    setIndex(0);
+    setHint(false);
+  });
+
+  const matches = useMemo(
+    () => props.items
+      .map(item => {
+        if (!query) return { item, score: 0 };
+        const hay = `${item.label} ${item.meta ?? ''} ${item.keywords ?? ''}`;
+        const m = fuzzyMatch(query, hay);
+        return m.matched ? { item, score: m.score } : null;
+      })
+      .filter((x): x is { item: SearchItem<T>; score: number } => x !== null)
+      .sort((a, b) => b.score - a.score),
+    [props.items, query],
+  );
 
   const clampedIndex = Math.min(index, Math.max(0, matches.length - 1));
   const scroll = Math.max(0, Math.min(clampedIndex - Math.floor(maxVisible / 2), Math.max(0, matches.length - maxVisible)));
   const windowed = matches.slice(scroll, scroll + maxVisible);
-  const cur = Math.max(0, Math.min(cursor, query.length));
 
   useInput((input, key) => {
-    if (key.upArrow) { setIndex(i => Math.max(0, i - 1)); setHint(false); }
-    else if (key.downArrow) { setIndex(i => Math.min(matches.length - 1, i + 1)); setHint(false); }
-    else if (key.leftArrow) setCursor(c => Math.max(0, Math.min(c, query.length) - 1));
-    else if (key.rightArrow) setCursor(c => Math.min(query.length, c + 1));
-    else if (key.ctrl && input === 'a') setCursor(0);
-    else if (key.ctrl && input === 'e') setCursor(query.length);
-    else if (key.return) { if (matches[clampedIndex]) props.onSubmit(matches[clampedIndex].item.value); else setHint(true); }
-    else if (key.escape) { if (query) { setQuery(''); setCursor(0); setIndex(0); setHint(false); } else props.onCancel?.(); }
-    else if (key.backspace) { setQuery(q => { const c = Math.min(cur, q.length); return q.slice(0, Math.max(0, c - 1)) + q.slice(c); }); setCursor(c => Math.max(0, Math.min(c, query.length) - 1)); setIndex(0); setHint(false); }
-    else if (key.delete) { setQuery(q => { const c = Math.min(cur, q.length); return q.slice(0, c) + q.slice(c + 1); }); setIndex(0); setHint(false); }
-    else if (input && !key.ctrl && !key.meta) { setQuery(q => { const c = Math.min(cur, q.length); return q.slice(0, c) + input + q.slice(c); }); setCursor(c => Math.min(query.length, c) + input.length); setIndex(0); setHint(false); }
+    if (key.upArrow) { setIndex(i => Math.max(0, i - 1)); setHint(false); return; }
+    if (key.downArrow) { setIndex(i => Math.min(matches.length - 1, i + 1)); setHint(false); return; }
+    if (key.return) { if (matches[clampedIndex]) props.onSubmit(matches[clampedIndex].item.value); else setHint(true); return; }
+    if (key.escape) { if (query) { reset(); setIndex(0); setHint(false); } else props.onCancel?.(); return; }
+    handleEditKey(input, key);
   });
 
   return (
@@ -186,21 +280,15 @@ export function TextPrompt(props: {
   onSubmit: (text: string) => void;
   onCancel?: () => void;
 }): JSX.Element {
-  const [value, setValue] = useState(props.initialValue ?? '');
-  const [cursor, setCursor] = useState((props.initialValue ?? '').length);
   const [hint, setHint] = useState(false);
-  const cur = Math.max(0, Math.min(cursor, value.length));
+  const { buffer: value, cursor: cur, handleEditKey } = useTextInput(props.initialValue ?? '', () => {
+    setHint(false);
+  });
 
   useInput((input, key) => {
-    if (key.return) { if (value.trim()) props.onSubmit(value.trim()); else setHint(true); }
-    else if (key.escape && props.onCancel) props.onCancel();
-    else if (key.leftArrow) setCursor(c => Math.max(0, Math.min(c, value.length) - 1));
-    else if (key.rightArrow) setCursor(c => Math.min(value.length, c + 1));
-    else if (key.ctrl && input === 'a') setCursor(0);
-    else if (key.ctrl && input === 'e') setCursor(value.length);
-    else if (key.backspace) { setValue(v => { const c = Math.min(cur, v.length); return v.slice(0, Math.max(0, c - 1)) + v.slice(c); }); setCursor(c => Math.max(0, Math.min(c, value.length) - 1)); setHint(false); }
-    else if (key.delete) { setValue(v => { const c = Math.min(cur, v.length); return v.slice(0, c) + v.slice(c + 1); }); setHint(false); }
-    else if (input && !key.ctrl && !key.meta) { setValue(v => { const c = Math.min(cur, v.length); return v.slice(0, c) + input + v.slice(c); }); setCursor(c => Math.min(value.length, c) + input.length); setHint(false); }
+    if (key.return) { if (value.trim()) props.onSubmit(value.trim()); else setHint(true); return; }
+    if (key.escape && props.onCancel) { props.onCancel(); return; }
+    handleEditKey(input, key);
   });
 
   const shown = props.mask ? '•'.repeat(value.length) : value;
@@ -230,21 +318,28 @@ export function SlashInput(props: {
   maxVisible?: number;
   onSubmit: (line: string) => void;
 }): JSX.Element {
-  const [buffer, setBuffer] = useState('');
-  const [cursor, setCursor] = useState(0);
   const [popIndex, setPopIndex] = useState(0);
   const [hint, setHint] = useState(false);
   const maxVisible = props.maxVisible ?? 8;
 
+  const { buffer, cursor: cur, set: setBuffer, reset, handleEditKey } = useTextInput('', () => {
+    setPopIndex(0);
+    setHint(false);
+  });
+
   const isSlash = buffer.startsWith('/');
   const q = isSlash ? buffer.slice(1) : '';
-  const items = isSlash
-    ? props.commands
-        .map(c => ({ c, m: fuzzyMatch(q, c.name) }))
-        .filter(x => x.m.matched)
-        .sort((a, b) => b.m.score - a.m.score)
-        .map(x => x.c)
-    : [];
+  const items = useMemo(
+    () => isSlash
+      ? props.commands
+          .map(c => ({ c, m: fuzzyMatch(q, c.name) }))
+          .filter(x => x.m.matched)
+          .sort((a, b) => b.m.score - a.m.score)
+          .map(x => x.c)
+      : [],
+    [props.commands, isSlash, q],
+  );
+
   // Command mode only while the buffer still looks like a command: it currently
   // matches something, or no space has been typed yet. A '/'-prefixed line that
   // stops matching once args are added falls back to being a plain task.
@@ -252,31 +347,24 @@ export function SlashInput(props: {
   const clampedPop = Math.min(popIndex, Math.max(0, items.length - 1));
   const scroll = Math.max(0, Math.min(clampedPop - Math.floor(maxVisible / 2), Math.max(0, items.length - maxVisible)));
   const windowed = items.slice(scroll, scroll + maxVisible);
-  const cur = Math.max(0, Math.min(cursor, buffer.length));
 
   useInput((input, key) => {
     if (slashActive && items.length > 0 && key.upArrow) { setPopIndex(i => Math.max(0, i - 1)); setHint(false); return; }
     if (slashActive && items.length > 0 && key.downArrow) { setPopIndex(i => Math.min(items.length - 1, i + 1)); setHint(false); return; }
-    if (key.leftArrow) { setCursor(c => Math.max(0, Math.min(c, buffer.length) - 1)); return; }
-    if (key.rightArrow) { setCursor(c => Math.min(buffer.length, c + 1)); return; }
-    if (key.ctrl && input === 'a') { setCursor(0); return; }
-    if (key.ctrl && input === 'e') { setCursor(buffer.length); return; }
     if (key.return) {
-      if (slashActive && items.length > 0) { props.onSubmit(`/${items[clampedPop].name}`); setBuffer(''); setCursor(0); setPopIndex(0); setHint(false); }
+      if (slashActive && items.length > 0) { props.onSubmit(`/${items[clampedPop].name}`); reset(); setPopIndex(0); setHint(false); }
       else if (slashActive && buffer.trim()) { setHint(true); }
-      else if (buffer.trim()) { props.onSubmit(buffer.trim()); setBuffer(''); setCursor(0); setPopIndex(0); setHint(false); }
+      else if (buffer.trim()) { props.onSubmit(buffer.trim()); reset(); setPopIndex(0); setHint(false); }
       else { setHint(true); }
       return;
     }
     if (slashActive && items.length > 0 && key.tab) {
-      const completed = `/${items[clampedPop].name}`;
-      setBuffer(completed); setCursor(completed.length); setPopIndex(0); setHint(false);
+      const completed = `/${items[clampedPop].name} `;
+      setBuffer(completed, completed.length); setPopIndex(0); setHint(false);
       return;
     }
-    if (key.escape) { setBuffer(''); setCursor(0); setPopIndex(0); setHint(false); return; }
-    if (key.backspace) { setBuffer(b => { const c = Math.min(cur, b.length); return b.slice(0, Math.max(0, c - 1)) + b.slice(c); }); setCursor(c => Math.max(0, Math.min(c, buffer.length) - 1)); setPopIndex(0); setHint(false); return; }
-    if (key.delete) { setBuffer(b => { const c = Math.min(cur, b.length); return b.slice(0, c) + b.slice(c + 1); }); setPopIndex(0); setHint(false); return; }
-    if (input && !key.ctrl && !key.meta) { setBuffer(b => { const c = Math.min(cur, b.length); return b.slice(0, c) + input + b.slice(c); }); setCursor(c => Math.min(buffer.length, c) + input.length); setPopIndex(0); setHint(false); }
+    if (key.escape) { reset(); setPopIndex(0); setHint(false); return; }
+    handleEditKey(input, key);
   });
 
   return (
@@ -307,6 +395,7 @@ export function SlashInput(props: {
         </Box>
       ) : null}
       {hint && !slashActive ? <Text dimColor>  enter a task to continue</Text> : null}
+      {hint && slashActive ? <Text dimColor>  command not found — type a task to continue</Text> : null}
     </Box>
   );
 }

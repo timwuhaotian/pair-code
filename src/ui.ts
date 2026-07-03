@@ -11,7 +11,7 @@ export const colors = {
   warn: '#fbbf24',
   info: '#60a5fa',
   accent: '#a78bfa',
-  accentDim: '#7c3aed',
+  accentDim: '#8b5cf6',
   brand: '#c4b5fd',
   dim: 'gray',
 } as const;
@@ -77,9 +77,85 @@ export function formatIterations(iteration: number, max: number): string {
 }
 
 export function truncate(str: string, maxLen: number): string {
-  if (str.length <= maxLen) return str;
+  // Operate on code points (via the spread) rather than UTF-16 code units so a
+  // truncation boundary never splits a surrogate pair (e.g. an emoji glyph).
+  const chars = [...str];
+  if (chars.length <= maxLen) return str;
   // maxLen <= 1 leaves no room for "<char>…", so bound the ellipsis itself to
   // maxLen rather than overflowing to maxLen+1 glyphs.
   if (maxLen <= 1) return (maxLen <= 0 ? '' : icons.ellipsis).slice(0, maxLen);
-  return str.slice(0, maxLen - 1) + icons.ellipsis;
+  return chars.slice(0, maxLen - 1).join('') + icons.ellipsis;
+}
+
+// ── Display helpers ─────────────────────────────────────────────────────
+// Profile/model label formatters. These are pure presentation, so they live in
+// the theme/formatter module rather than the provider-resolution module.
+
+const KNOWN_BRANDS: Record<string, string> = {
+  gpt: 'GPT',
+  glm: 'GLM',
+  llama: 'Llama',
+  qwen: 'Qwen',
+  kimi: 'Kimi',
+  gemini: 'Gemini',
+  gemma: 'Gemma',
+  claude: 'Claude',
+  anthropic: 'Anthropic',
+  grok: 'Grok',
+  deepseek: 'DeepSeek',
+  minimax: 'MiniMax',
+  moonshot: 'Moonshot',
+  openrouter: 'OpenRouter',
+  zhipu: 'Zhipu',
+};
+
+const ACRONYMS = new Set(['gpt', 'glm', 'llm', 'tts', 'stt', 'ocr', 'ai']);
+
+export function humanizeProfileName(raw: string): string {
+  const lower = raw.toLowerCase();
+  for (const brand in KNOWN_BRANDS) {
+    if (!lower.startsWith(brand)) continue;
+    const rest = lower.slice(brand.length);
+    // Bare brand → just the brand label.
+    if (!rest) return KNOWN_BRANDS[brand];
+    // Brand + separated suffix (e.g. 'anthropic-eu') → keep the suffix so labels
+    // stay unique (e.g. 'Anthropic (eu)'). A run-on like 'anthropicfoo' isn't a
+    // clean brand match, so fall through to default titlecasing instead.
+    const suffix = rest.replace(/^[-_.]+/, '');
+    if (suffix.length < rest.length) return `${KNOWN_BRANDS[brand]} (${suffix})`;
+    break;
+  }
+  return raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase();
+}
+
+export function inferTier(id: string): 'flagship' | 'standard' | 'fast' | 'light' {
+  const lower = id.toLowerCase();
+  if (/\b(opus|pro|max|flagship|ultra|m2|reasoner)\b/.test(lower)) return 'flagship';
+  if (/\b(haiku|mini|flash|nano|fast|small|light|air)\b/.test(lower)) return 'fast';
+  if (/\b(free|tiny)\b/.test(lower)) return 'light';
+  return 'standard';
+}
+
+function formatSegment(part: string): string {
+  const lower = part.toLowerCase();
+  if (ACRONYMS.has(lower)) return lower.toUpperCase();
+  for (const brand in KNOWN_BRANDS) {
+    if (lower.startsWith(brand)) return KNOWN_BRANDS[brand] + part.slice(brand.length);
+  }
+  if (/^\d/.test(part)) return part;
+  return part.charAt(0).toUpperCase() + part.slice(1);
+}
+
+export function humanizeModelId(id: string): string {
+  const last = id.split('/').pop() ?? id;
+  const parts = last.split('-');
+  const out: string[] = [];
+  for (const part of parts) {
+    if (/^\d+$/.test(part) && out.length > 0 && /^[\d.]+$/.test(out[out.length - 1])) {
+      out[out.length - 1] = out[out.length - 1] + '.' + part;
+      continue;
+    }
+    out.push(formatSegment(part));
+  }
+  return out.join(' ');
 }

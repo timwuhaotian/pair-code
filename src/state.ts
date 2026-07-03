@@ -169,6 +169,10 @@ export function getConversationHistory(state: PairState): string {
 // exec default, which otherwise throws ENOBUFS and silently drops changes.
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 const GIT_TIMEOUT_MS = 30_000;
+// Valid single-letter status codes from `git diff --name-status`. Unmerged
+// codes like U (and anything unexpected) aren't in ModifiedFile['status'], so
+// they default to 'M' to keep the file visible rather than dropping it.
+const KNOWN_DIFF_STATUSES = new Set(['A', 'M', 'D', 'R', 'C', 'T']);
 
 /**
  * Classify the directory's git state. Returns 'no-git' when the git binary is
@@ -186,8 +190,9 @@ async function probeGitStatus(directory: string): Promise<PairState['gitStatus']
     return stdout.trim() === 'true' ? 'ok' : 'no-repo';
   } catch (err) {
     // ENOENT (binary absent) or exit 127 ("command not found") → no git.
-    const code = (err as NodeJS.ErrnoException & { status?: number }).code;
-    const status = (err as { status?: number }).status;
+    const e = err as NodeJS.ErrnoException & { status?: number };
+    const code = e.code;
+    const status = e.status;
     if (code === 'ENOENT' || status === 127) return 'no-git';
     // Ran but exited non-zero (e.g. "not a git repository").
     return 'no-repo';
@@ -203,18 +208,27 @@ export async function getGitChanges(directory: string): Promise<{ files: Modifie
 
   try {
     // core.quotePath=false keeps non-ASCII paths verbatim instead of C-quoted
-    // octal escapes (e.g. "\303\251" for "é").
-    const { stdout: tracked } = await execFile('git', ['-c', 'core.quotePath=false', 'diff', '--name-status', 'HEAD'], { cwd: directory, encoding: 'utf-8', maxBuffer: GIT_MAX_BUFFER, timeout: GIT_TIMEOUT_MS });
-    const { stdout: untracked } = await execFile('git', ['-c', 'core.quotePath=false', 'ls-files', '--others', '--exclude-standard'], { cwd: directory, encoding: 'utf-8', maxBuffer: GIT_MAX_BUFFER, timeout: GIT_TIMEOUT_MS });
+    // octal escapes (e.g. "\303\251" for "é"). The two scans are independent
+    // reads, so run them concurrently.
+    const [{ stdout: tracked }, { stdout: untracked }] = await Promise.all([
+      execFile('git', ['-c', 'core.quotePath=false', 'diff', '--name-status', 'HEAD'], { cwd: directory, encoding: 'utf-8', maxBuffer: GIT_MAX_BUFFER, timeout: GIT_TIMEOUT_MS }),
+      execFile('git', ['-c', 'core.quotePath=false', 'ls-files', '--others', '--exclude-standard'], { cwd: directory, encoding: 'utf-8', maxBuffer: GIT_MAX_BUFFER, timeout: GIT_TIMEOUT_MS }),
+    ]);
 
-    const files: ModifiedFile[] = tracked.trim().split('\n').filter(Boolean).map(line => {
+    const files: ModifiedFile[] = tracked.trim().split('\n').filter(Boolean).flatMap(line => {
       const parts = line.split('\t');
       // git diff --name-status emits e.g. "R100\told\tnew" for renames and
       // "C75\tsrc\tdst" for copies. The status letter is the first char; the
       // destination path is the last segment for renames/copies, otherwise [1].
-      const status = parts[0].charAt(0) as ModifiedFile['status'];
+      // A line with no tab is malformed — skip it rather than emit an entry
+      // with an undefined path.
+      if (parts.length < 2) return [];
+      const letter = parts[0].charAt(0);
+      // Unknown codes (e.g. U for unmerged) aren't in ModifiedFile['status'];
+      // default to 'M' so the file stays visible instead of being dropped.
+      const status: ModifiedFile['status'] = KNOWN_DIFF_STATUSES.has(letter) ? letter as ModifiedFile['status'] : 'M';
       const path = parts.length > 2 ? parts[parts.length - 1] : parts[1];
-      return { path, status };
+      return [{ path, status }];
     });
 
     for (const path of untracked.trim().split('\n').filter(Boolean)) {

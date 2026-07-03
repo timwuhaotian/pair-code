@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-02
+
+### Added
+- `src/prompts.ts` — prompt templates extracted from `process.ts` for separation of concerns.
+- `src/verdict.ts` — verdict JSON parsing domain logic extracted from `components.tsx`.
+- Retry with exponential backoff for transient SDK failures (429, timeout, network) in `runTurn()`.
+- Stale/expired resume-session recovery — clears `sessionId` and retries once without `resume`.
+- Error message redaction (`sk-...`, `Bearer ...`) before storing in `state.lastError`.
+- Ctrl+U / Ctrl+K readline shortcuts in all text input components.
+- Home / End / PageUp / PageDown navigation in `Select`.
+- Tab completion appends a trailing space in `SlashInput`.
+- "Command not found" feedback when Enter is pressed on an invalid slash command.
+- Visual task-boundary separator in the transcript when a new task starts.
+- HTTP warning for env-profile `http://` base URLs (non-localhost) — mirrors the interactive form's warning.
+- Config migration logic with fail-closed for unknown future versions.
+- `profileLabel()` accepts a pre-loaded `Profile[]` to avoid repeated disk reads.
+
+### Changed
+- `useEffect` unmount cleanup in `Session` uses `[]` deps — was `[engine]`, which fired `requestStop()` every ~60ms during streaming and broke multi-turn sessions.
+- SDK result-message fields (`msg.usage`, `msg.result`, `msg.errors`, `msg.message.content`) now null-guarded with optional chaining and type checks.
+- Git diff status code validated against known set (defaults to `'M'` for unknown); missing tab in diff line no longer yields `undefined` path.
+- `addEndpoint()` / `forgetProfile()` wrapped in try-catch — corrupt config no longer crashes the app from an event handler.
+- Elapsed-time ticker moved from `Session` to `StatusBarTicker` — only `StatusBar` re-renders 4×/sec instead of the full tree.
+- `ConfigMenu` / `CredsManager` use `useMemo` for `persistedProfiles()` — no more sync `readFileSync` during render.
+- Slash-command dispatch unified into `dispatchSlashCommand()` — shared by setup wizard and session.
+- Cursor-editing logic extracted to `useTextInput` hook — eliminates duplication across `SearchSelect`, `TextPrompt`, `SlashInput`.
+- Stale-closure fix: cursor position computed inside functional state updaters, not from render-time value.
+- `LiveTurn` text split wrapped in `useMemo` — was re-splitting the full buffer every ~60ms.
+- `extractJsonBlocks` now tracks string context — braces inside JSON string values no longer split blocks prematurely.
+- `ErrorBoundary` moved from `index.ts` to `components.tsx` (now uses JSX instead of `createElement`).
+- Display-formatting helpers (`humanizeModelId`, `humanizeProfileName`, `inferTier`) moved from `providers.ts` to `ui.ts`.
+- `Static` items use a discriminated union instead of an unsafe `as Message` cast.
+- `/diff` async result guarded against `setNotice` after unmount.
+- `writeConfig()` uses `O_EXCL` temp-file creation — prevents symlink interception attacks.
+- `readConfig()` drops `existsSync` TOCTOU — catches `ENOENT` directly.
+- Token usage attached to thrown errors so cost is accumulated even on failed turns.
+- `query()` moved inside `try` block — timeout timer no longer leaks on sync throw.
+- `liveTextRef` capped to 8KB — reduces memory/GC pressure for long turns.
+- `StatusBar` and `ResultPanel` wrapped in `React.memo`.
+- `ToolLine` truncation adapts to terminal width via `useStdout()`.
+- `Banner` uses `useStdout()` instead of `process.stdout.columns` directly.
+- `SearchSelect` / `SlashInput` fuzzy matches wrapped in `useMemo`.
+- `accentDim` brightened from `#7c3aed` to `#8b5cf6` for better contrast on dark terminals.
+- `truncate()` uses code-point spread (`[...str]`) — can't split surrogate pairs in emoji.
+- Dead exports removed from `process.ts` (`runTurn`, `TurnCallbacks`, `TurnResult`).
+- Unreachable `trimmedOutput === ''` branch removed from no-progress guard.
+- Redundant double cast in `state.ts` consolidated.
+- `getGitChanges` parallelizes two independent git commands via `Promise.all`.
+- `useTranscript` hook extracted from `Session` for message accumulation + boundary insertion.
+- README corrected: subprocess receives a minimal env (only the role's key + base URL), not the full `process.env`.
+- README documents that saved credentials are accessible to the Executor subprocess.
+- Version fallback in `index.ts` updated from `0.2.0` to `0.2.1`.
+
+### Fixed
+- **Critical**: `useEffect(() => () => engine.requestStop(), [engine])` fired cleanup every ~60ms during streaming, prematurely interrupting every in-flight turn and making multi-turn sessions impossible (v0.2.1 regression).
+- `msg.usage.output_tokens` accessed without null guard — `TypeError` masked real SDK errors on non-success results.
+- Git diff parsing accepted invalid status codes via unsafe cast; missing tab yielded `undefined` path.
+- `addEndpoint()` / `forgetProfile()` threw uncaught `CorruptConfigError` from event handlers — crashed the app.
+- `query()` outside `try/finally` — 10-minute timeout timer leaked on sync throw.
+
 ## [0.2.1] - 2026-07-03
 
 ### Added

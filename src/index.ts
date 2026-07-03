@@ -3,10 +3,10 @@ import { statSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
-import { Component, createElement } from 'react';
-import type { ReactNode } from 'react';
-import { render, Text, Box } from 'ink';
+import { createElement } from 'react';
+import { render } from 'ink';
 import { App } from './app.js';
+import { ErrorBoundary } from './components.js';
 import { loadProfiles } from './providers.js';
 import { readConfig, configPath } from './config.js';
 
@@ -20,9 +20,9 @@ const VERSION = ((): string => {
   try {
     const require = createRequire(import.meta.url);
     const pkg = require('../package.json') as { version?: string };
-    return pkg.version ?? '0.2.0';
+    return pkg.version ?? '0.2.1';
   } catch {
-    return '0.2.0';
+    return '0.2.1';
   }
 })();
 
@@ -103,43 +103,6 @@ async function warnIfNotGitRepo(directory: string): Promise<void> {
   }
   if (!inside) {
     console.error(`WARNING: ${directory} is not inside a git repository — change tracking will be disabled.`);
-  }
-}
-
-// ── Error boundary ──────────────────────────────────────────────────────
-// Catches render-time errors inside the Ink tree so a broken component shows
-// a readable message instead of an opaque raw-mode / React stack crash.
-
-interface ErrorBoundaryProps {
-  children: ReactNode;
-}
-
-interface ErrorBoundaryState {
-  error: Error | null;
-}
-
-class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
-  state: ErrorBoundaryState = { error: null };
-
-  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
-    return { error };
-  }
-
-  componentDidCatch(): void {
-    // Give Ink a tick to paint the fallback UI, then exit non-zero.
-    setTimeout(() => process.exit(1), 100);
-  }
-
-  render(): ReactNode {
-    if (this.state.error) {
-      return createElement(
-        Box,
-        { flexDirection: 'column' },
-        createElement(Text, { color: 'red' }, `Something went wrong: ${this.state.error.message}`),
-        createElement(Text, { dimColor: true }, 'Please restart the app.'),
-      );
-    }
-    return this.props.children;
   }
 }
 

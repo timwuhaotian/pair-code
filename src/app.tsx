@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useMemo, type ReactNode, type JSX } from 'react';
+import { useEffect, useRef, useState, useMemo, useCallback, type ReactNode, type JSX } from 'react';
 import { Box, Text, Static, useApp, useInput, useStdout } from 'ink';
 import type { PairState, Message, Profile } from './types.js';
 import { loadProfiles, suggestModels, profileLabel, addEndpoint, forgetProfile, persistedProfiles } from './providers.js';
@@ -35,6 +35,56 @@ interface RolePick { profileName: string; baseUrl: string; model: string }
 
 const ADD_ENDPOINT = '__add_endpoint__';
 const SAME_AS_MENTOR = '__same_as_mentor__';
+
+// A transcript entry is either a regular message or a task-boundary divider
+// inserted when a new task starts (detected by the message array shrinking).
+type TranscriptEntry = Message | { boundary: true; id: string };
+
+// Discriminated union for <Static> items — replaces an unsafe `as Message` cast
+// that previously mixed the banner sentinel with real Message objects.
+type StaticItem =
+  | { type: 'banner' }
+  | { type: 'message'; msg: Message }
+  | { type: 'task_boundary'; id: string };
+
+/** Shared slash-command dispatch for setup and session. Commands that differ
+ *  between contexts are delegated via callbacks; identical ones are handled
+ *  inline. Returns true if the command was handled, false otherwise. */
+interface SlashCtx {
+  setNotice: (n: ReactNode | null) => void;
+  setOverlay: (o: 'mentor' | 'runner' | 'config' | 'creds') => void;
+  profiles: Profile[];
+  helpCommands: SlashCommand[];
+  modelNotice: ReactNode;
+  onQuit: () => void;
+  onTask: (arg: string) => void;
+  onClear: () => void;
+}
+
+function dispatchSlashCommand(cmd: string, arg: string, ctx: SlashCtx): boolean {
+  switch (cmd) {
+    case 'quit': case 'exit': ctx.onQuit(); break;
+    case 'config': ctx.setOverlay('config'); break;
+    case 'mentor': ctx.setOverlay('mentor'); break;
+    case 'executor': case 'runner': ctx.setOverlay('runner'); break;
+    case 'task':
+      if (arg) ctx.onTask(arg);
+      else ctx.setNotice(<Text dimColor>Usage: /task &lt;spec&gt;</Text>);
+      break;
+    case 'model': ctx.setNotice(ctx.modelNotice); break;
+    case 'profiles':
+      ctx.setNotice(<Text dimColor>{ctx.profiles.map(p => p.label).join(' · ') || 'No profiles configured.'}</Text>);
+      break;
+    case 'help':
+      ctx.setNotice(
+        <Box flexDirection="column">{ctx.helpCommands.map(c => <Text key={c.name}><Text color={colors.accent}>/{c.name}</Text><Text dimColor>{' '.repeat(Math.max(1, 10 - c.name.length))}{c.description}</Text></Text>)}</Box>,
+      );
+      break;
+    case 'clear': ctx.onClear(); break;
+    default: return false;
+  }
+  return true;
+}
 
 // ── Endpoint entry (base URL + key, held in memory only) ─────────────────
 
@@ -141,6 +191,7 @@ function RolePicker(props: {
   const [chosen, setChosen] = useState<Profile | null>(null);
   const [adding, setAdding] = useState(false);
   const [custom, setCustom] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   if (adding) {
     return (
@@ -148,7 +199,17 @@ function RolePicker(props: {
         <Text dimColor>  Add an Anthropic-compatible endpoint (this session only)</Text>
         <EndpointForm
           onCancel={() => setAdding(false)}
-          onDone={({ baseUrl, apiKey, remember }) => { const r = addEndpoint({ baseUrl, apiKey, remember }); props.onProfilesChanged?.(); setAdding(false); setChosen(r); }}
+          onDone={({ baseUrl, apiKey, remember }) => {
+            try {
+              const r = addEndpoint({ baseUrl, apiKey, remember });
+              props.onProfilesChanged?.();
+              setAdding(false);
+              setChosen(r);
+            } catch (err) {
+              setError(err instanceof Error ? err.message : 'failed to save endpoint');
+              setAdding(false);
+            }
+          }}
         />
       </Box>
     );
@@ -156,23 +217,26 @@ function RolePicker(props: {
 
   if (!chosen) {
     return (
-      <Select
-        message={`${props.roleLabel} (${props.roleSubtitle}) — pick endpoint`}
-        initialIndex={props.sameAs
-          ? (props.highlightSameAs ? 0 : props.defaultProfileIndex + 1)
-          : props.defaultProfileIndex}
-        items={[
-          ...(props.sameAs ? [{ label: 'Same as Mentor', value: SAME_AS_MENTOR, hint: props.sameAs.hint }] : []),
-          ...props.profiles.map(p => ({ label: p.label, value: p.name, hint: p.baseUrl || 'official api' })),
-          { label: '+ Add an endpoint…', value: ADD_ENDPOINT, hint: 'base URL + key' },
-        ]}
-        onSubmit={(name) => {
-          if (name === SAME_AS_MENTOR) { props.onDone(props.sameAs!.pick); return; }
-          if (name === ADD_ENDPOINT) { setAdding(true); return; }
-          setChosen(props.profiles.find(p => p.name === name)!);
-        }}
-        onCancel={props.onCancel}
-      />
+      <Box flexDirection="column">
+        {error ? <Text color={colors.error}>  {error}</Text> : null}
+        <Select
+          message={`${props.roleLabel} (${props.roleSubtitle}) — pick endpoint`}
+          initialIndex={props.sameAs
+            ? (props.highlightSameAs ? 0 : props.defaultProfileIndex + 1)
+            : props.defaultProfileIndex}
+          items={[
+            ...(props.sameAs ? [{ label: 'Same as Mentor', value: SAME_AS_MENTOR, hint: props.sameAs.hint }] : []),
+            ...props.profiles.map(p => ({ label: p.label, value: p.name, hint: p.baseUrl || 'official api' })),
+            { label: '+ Add an endpoint…', value: ADD_ENDPOINT, hint: 'base URL + key' },
+          ]}
+          onSubmit={(name) => {
+            if (name === SAME_AS_MENTOR) { props.onDone(props.sameAs!.pick); return; }
+            if (name === ADD_ENDPOINT) { setAdding(true); return; }
+            setChosen(props.profiles.find(p => p.name === name)!);
+          }}
+          onCancel={props.onCancel}
+        />
+      </Box>
     );
   }
 
@@ -276,27 +340,27 @@ function SetupWizard(props: {
     if (!line.startsWith('/')) { submitSpec(line); return; }
     const [cmd, ...rest] = line.slice(1).split(/\s+/);
     const arg = rest.join(' ').trim();
-    switch (cmd) {
-      case 'quit': case 'exit': exit(); break;
-      case 'config': setOverlay('config'); break;
-      case 'mentor': setOverlay('mentor'); break;
-      case 'executor': case 'runner': setOverlay('runner'); break;
-      case 'task': if (arg) submitSpec(arg); else setNotice(<Text dimColor>Usage: /task &lt;spec&gt;</Text>); break;
-      case 'model': setNotice(
+    if (!dispatchSlashCommand(cmd, arg, {
+      setNotice,
+      setOverlay,
+      profiles,
+      helpCommands: SETUP_SLASH_COMMANDS,
+      modelNotice: (
         <Box flexDirection="column">
           <Text><Text color={colors.mentor}>{icons.mentor} Mentor   </Text>{mentorHint}</Text>
           <Text><Text color={colors.executor}>{icons.executor} Executor </Text>{executorHint}</Text>
-        </Box>); break;
-      case 'profiles': setNotice(<Text dimColor>{profiles.map(p => p.label).join(' · ') || 'No profiles configured.'}</Text>); break;
-      case 'help': setNotice(
-        <Box flexDirection="column">{SETUP_SLASH_COMMANDS.map(c => <Text key={c.name}><Text color={colors.accent}>/{c.name}</Text><Text dimColor>{' '.repeat(Math.max(1, 10 - c.name.length))}{c.description}</Text></Text>)}</Box>); break;
-      case 'clear': write('\x1B[2J\x1B[3J\x1B[H'); break;
-      default: setNotice(<Text color={colors.error}>Unknown command: /{cmd}</Text>);
+        </Box>
+      ),
+      onQuit: () => exit(),
+      onTask: submitSpec,
+      onClear: () => write('\x1B[2J\x1B[3J\x1B[H'),
+    })) {
+      setNotice(<Text color={colors.error}>Unknown command: /{cmd}</Text>);
     }
   };
 
   if (overlay === 'config') {
-    return <ConfigMenu mentorHint={mentorHint} executorHint={executorHint} onPick={(o) => setOverlay(o)} onClose={() => setOverlay(null)} />;
+    return <ConfigMenu mentorHint={mentorHint} executorHint={executorHint} profileTick={profileTick} onPick={(o) => setOverlay(o)} onClose={() => setOverlay(null)} />;
   }
 
   if (overlay === 'creds') {
@@ -375,10 +439,11 @@ function SetupWizard(props: {
 function ConfigMenu(props: {
   mentorHint: string;
   executorHint: string;
+  profileTick: number;
   onPick: (overlay: 'mentor' | 'runner' | 'creds') => void;
   onClose: () => void;
 }): JSX.Element {
-  const savedCount = persistedProfiles().length;
+  const savedCount = useMemo(() => persistedProfiles().length, [props.profileTick]);
   return (
     <Box flexDirection="column" marginY={1}>
       <Select
@@ -400,7 +465,7 @@ function ConfigMenu(props: {
 function CredsManager(props: { onBack: () => void; onNotice: (n: ReactNode) => void; onProfilesChanged?: () => void }): JSX.Element {
   const [tick, setTick] = useState(0);
   const [pending, setPending] = useState<string | null>(null);
-  const saved = persistedProfiles(); // re-read on each render; `tick` forces it after a delete
+  const saved = useMemo(() => persistedProfiles(), [tick]); // re-read only when `tick` changes
 
   if (saved.length === 0) {
     return (
@@ -424,7 +489,15 @@ function CredsManager(props: { onBack: () => void; onNotice: (n: ReactNode) => v
             { label: 'Yes, delete the key from disk', value: 'yes' },
           ]}
           onSubmit={(v) => {
-            if (v === 'yes') { forgetProfile(pending); props.onProfilesChanged?.(); props.onNotice(<Text dimColor>{icons.check} removed saved credentials for {label}</Text>); }
+            if (v === 'yes') {
+              try {
+                forgetProfile(pending);
+                props.onProfilesChanged?.();
+                props.onNotice(<Text dimColor>{icons.check} removed saved credentials for {label}</Text>);
+              } catch (err) {
+                props.onNotice(<Text color={colors.error}>{err instanceof Error ? err.message : 'failed to remove credentials'}</Text>);
+              }
+            }
             setPending(null);
             setTick(t => t + 1);
           }}
@@ -449,6 +522,47 @@ function CredsManager(props: { onBack: () => void; onNotice: (n: ReactNode) => v
   );
 }
 
+// ── Transcript hook ──────────────────────────────────────────────────────
+
+/** Accumulate messages into a monotonic transcript that survives task resets.
+ *  When the message array shrinks (new task via freshTask), a visual boundary
+ *  divider is inserted so the user sees where the new task begins. Returns the
+ *  transcript and a clear() callback for the /clear command. */
+function useTranscript(messages: Message[]): [TranscriptEntry[], () => void] {
+  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  const lastMsgCount = useRef(0);
+  useEffect(() => {
+    const total = messages.length;
+    // If messages array shrank (e.g. new task via freshTask), reset counter
+    // and insert a visual boundary so the user sees where the new task begins.
+    if (total < lastMsgCount.current) {
+      lastMsgCount.current = 0;
+      setTranscript(prev => [...prev, { boundary: true, id: `__boundary_${Date.now()}` }]);
+    }
+    if (total <= lastMsgCount.current) return;
+    const fresh = messages.slice(lastMsgCount.current);
+    lastMsgCount.current = total;
+    setTranscript(prev => [...prev, ...fresh]);
+  }, [messages]);
+  const clear = useCallback(() => setTranscript([]), []);
+  return [transcript, clear];
+}
+
+// ── Status bar ticker ────────────────────────────────────────────────────
+
+/** Wraps StatusBar with its own elapsed timer so only this subtree re-renders
+ *  4×/sec, not the entire Session. */
+function StatusBarTicker({ state, running }: { state: PairState; running: boolean }): JSX.Element {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!running) return;
+    const t = setInterval(() => setElapsed(Date.now() - state.createdAt), 250);
+    return () => clearInterval(t);
+  }, [running, state.createdAt]);
+  const elapsedMs = running ? elapsed : (state.finishedAt ?? state.createdAt) - state.createdAt;
+  return <StatusBar state={state} elapsedMs={elapsedMs} />;
+}
+
 // ── Session ──────────────────────────────────────────────────────────────
 
 function Session(props: { initialState: PairState }): JSX.Element {
@@ -461,12 +575,11 @@ function Session(props: { initialState: PairState }): JSX.Element {
 
   const [overlay, setOverlay] = useState<null | 'mentor' | 'runner' | 'config' | 'creds'>(null);
   const [notice, setNotice] = useState<ReactNode | null>(null);
-  const [elapsed, setElapsed] = useState(0);
-  const [transcript, setTranscript] = useState<Message[]>([]);
+  const [transcript, clearTranscript] = useTranscript(state.messages);
   const [stopping, setStopping] = useState(false);
   const [clearTick, setClearTick] = useState(0);
-  const lastMsgCount = useRef(0);
   const started = useRef(false);
+  const mountedRef = useRef(true);
 
   // Auto-run the first task once.
   useEffect(() => {
@@ -476,27 +589,15 @@ function Session(props: { initialState: PairState }): JSX.Element {
   }, [engine, props.initialState]);
 
   // On unmount (including Ink's Ctrl+C exit) interrupt any in-flight SDK query
-  // so we never orphan a paid agent subprocess.
-  useEffect(() => () => engine.requestStop(), [engine]);
+  // so we never orphan a paid agent subprocess. requestStop is a stable
+  // useCallback (empty deps) so the closure captures the right function; the
+  // empty dependency array ensures cleanup fires only on unmount, not on every
+  // engine re-memo during streaming.
+  useEffect(() => () => engine.requestStop(), []);
 
-  // Append new messages into the monotonic transcript (survives task resets).
-  // Index-based: O(1) instead of O(n) filter on every state change.
-  useEffect(() => {
-    const total = state.messages.length;
-    // If messages array shrank (e.g. new task via freshTask), reset counter.
-    if (total < lastMsgCount.current) lastMsgCount.current = 0;
-    if (total <= lastMsgCount.current) return;
-    const fresh = state.messages.slice(lastMsgCount.current);
-    lastMsgCount.current = total;
-    setTranscript(prev => [...prev, ...fresh]);
-  }, [state.messages]);
-
-  // Elapsed ticker while running.
-  useEffect(() => {
-    if (!engine.running) return;
-    const t = setInterval(() => setElapsed(Date.now() - state.createdAt), 250);
-    return () => clearInterval(t);
-  }, [engine.running, state.createdAt]);
+  // Track mount state so fire-and-forget async callbacks (e.g. /diff) don't
+  // call setState after unmount.
+  useEffect(() => () => { mountedRef.current = false; }, []);
 
   // Clear stopping feedback once the turn finishes.
   useEffect(() => { if (!engine.running) setStopping(false); }, [engine.running]);
@@ -513,12 +614,23 @@ function Session(props: { initialState: PairState }): JSX.Element {
     const [cmd, ...rest] = line.slice(1).split(/\s+/);
     if (!cmd) { setNotice(<Text dimColor>Type a command after / — try /help</Text>); return; }
     const arg = rest.join(' ').trim();
+    if (dispatchSlashCommand(cmd, arg, {
+      setNotice,
+      setOverlay,
+      profiles,
+      helpCommands: SLASH_COMMANDS,
+      modelNotice: (
+        <Box flexDirection="column">
+          <Text><Text color={colors.mentor}>{icons.mentor} Mentor   </Text>{profileLabel(state.mentor.profileName)} <Text dimColor>/</Text> {state.mentor.model}</Text>
+          <Text><Text color={colors.executor}>{icons.executor} Executor </Text>{profileLabel(state.executor.profileName)} <Text dimColor>/</Text> {state.executor.model}</Text>
+        </Box>
+      ),
+      onQuit: () => { engine.requestStop(); exit(); },
+      onTask: (a) => void runReplace(freshTask(state, a)),
+      onClear: () => { write('\x1B[2J\x1B[3J\x1B[H'); clearTranscript(); setClearTick(t => t + 1); },
+    })) return;
+    // Session-only commands not in the shared dispatcher.
     switch (cmd) {
-      case 'quit': case 'exit': engine.requestStop(); exit(); break;
-      case 'config': setOverlay('config'); break;
-      case 'mentor': setOverlay('mentor'); break;
-      case 'executor': case 'runner': setOverlay('runner'); break;
-      case 'task': if (arg) void runReplace(freshTask(state, arg)); else setNotice(<Text dimColor>Usage: /task &lt;spec&gt;</Text>); break;
       case 'hello':
         if (engine.running) setNotice(<Text dimColor>Finish or stop the current turn before /hello.</Text>);
         else void runGreeting(freshGreeting(state));
@@ -530,24 +642,17 @@ function Session(props: { initialState: PairState }): JSX.Element {
         void engine.runTask(next);
         break;
       }
-      case 'model': setNotice(
-        <Box flexDirection="column">
-          <Text><Text color={colors.mentor}>{icons.mentor} Mentor   </Text>{profileLabel(state.mentor.profileName)} <Text dimColor>/</Text> {state.mentor.model}</Text>
-          <Text><Text color={colors.executor}>{icons.executor} Executor </Text>{profileLabel(state.executor.profileName)} <Text dimColor>/</Text> {state.executor.model}</Text>
-        </Box>); break;
       case 'status': setNotice(<Text dimColor>{state.status} · iter {formatIterations(state.iteration, state.maxIterations)} · {state.messages.length} messages · {state.modifiedFiles.length} files</Text>); break;
       case 'files': setNotice(
         state.modifiedFiles.length === 0 ? <Text dimColor>No files modified yet.</Text> :
         <Box flexDirection="column">{state.modifiedFiles.map((f) => <Text key={f.path}><Text color={colors.success}>{f.status}</Text>  {f.path}</Text>)}</Box>); break;
       case 'diff': {
         setNotice(<Text dimColor>loading diff…</Text>);
-        void getGitDiffStat(state.directory).then(out => setNotice(<Text dimColor>{out.trim() || 'No git diff available.'}</Text>)).catch(() => setNotice(<Text dimColor>No git diff available.</Text>));
+        void getGitDiffStat(state.directory)
+          .then(out => { if (mountedRef.current) setNotice(<Text dimColor>{out.trim() || 'No git diff available.'}</Text>); })
+          .catch(() => { if (mountedRef.current) setNotice(<Text dimColor>No git diff available.</Text>); });
         break;
       }
-      case 'profiles': setNotice(<Text dimColor>{profiles.map(p => p.label).join(' · ') || 'No profiles configured.'}</Text>); break;
-      case 'help': setNotice(
-        <Box flexDirection="column">{SLASH_COMMANDS.map(c => <Text key={c.name}><Text color={colors.accent}>/{c.name}</Text><Text dimColor>{' '.repeat(Math.max(1, 10 - c.name.length))}{c.description}</Text></Text>)}</Box>); break;
-      case 'clear': write('\x1B[2J\x1B[3J\x1B[H'); setTranscript([]); setClearTick(t => t + 1); break;
       default: setNotice(<Text color={colors.error}>Unknown command: /{cmd}</Text>);
     }
   };
@@ -557,6 +662,7 @@ function Session(props: { initialState: PairState }): JSX.Element {
       <ConfigMenu
         mentorHint={`${profileLabel(state.mentor.profileName)} / ${state.mentor.model}`}
         executorHint={`${profileLabel(state.executor.profileName)} / ${state.executor.model}`}
+        profileTick={profileTick}
         onPick={(o) => setOverlay(o)}
         onClose={() => setOverlay(null)}
       />
@@ -597,16 +703,27 @@ function Session(props: { initialState: PairState }): JSX.Element {
     );
   }
 
+  const staticItems: StaticItem[] = useMemo(() => [
+    { type: 'banner' as const },
+    ...transcript.map((t): StaticItem =>
+      'boundary' in t ? { type: 'task_boundary' as const, id: t.id } : { type: 'message' as const, msg: t }),
+  ], [transcript]);
+
   const terminal = state.status === 'finished' || state.status === 'paused' || state.status === 'error';
 
   return (
     <Box flexDirection="column">
-      <Static key={clearTick} items={[{ id: '__banner__' } as { id: string }, ...transcript]}>
-        {(item) => {
-          if (item.id === '__banner__') return <Banner key="banner" />;
-          const m = item as Message;
-          if (m.type === 'handoff') return <ConnectorLine key={m.id} label={`handed to ${m.to}`} />;
-          return <MessageView key={m.id} msg={m} />;
+      <Static key={clearTick} items={staticItems}>
+        {(item: StaticItem) => {
+          switch (item.type) {
+            case 'banner': return <Banner key="banner" />;
+            case 'task_boundary': return <Box key={item.id} marginY={1}><Text dimColor>── new task ──</Text></Box>;
+            case 'message': {
+              const m = item.msg;
+              if (m.type === 'handoff') return <ConnectorLine key={m.id} label={`handed to ${m.to}`} />;
+              return <MessageView key={m.id} msg={m} />;
+            }
+          }
         }}
       </Static>
 
@@ -617,7 +734,7 @@ function Session(props: { initialState: PairState }): JSX.Element {
       ) : null}
 
       <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor={colors.accentDim} paddingX={1}>
-        <StatusBar state={state} elapsedMs={engine.running ? elapsed : (state.finishedAt ?? state.createdAt) - state.createdAt} />
+        <StatusBarTicker state={state} running={engine.running} />
         {/* During a live turn the LiveTurn header already shows the active agent in
             detail, so the AgentBar would just duplicate it — show it only at rest. */}
         {!engine.running ? <AgentBar state={state} /> : null}

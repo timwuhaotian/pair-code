@@ -74,7 +74,7 @@ Use `pair` as the primary command; `pair-code` remains available as a compatibil
 3. **Mentor** reviews the changes — it can read files but **cannot mutate anything** (enforced by the SDK: `allowedTools: ['Read','Grep','Glob']`, everything else disallowed).
 4. They loop until the Mentor emits `TASK_COMPLETE`, or the iteration budget (default: unlimited, configurable) is hit.
 
-Both roles are orchestrated through the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript), which runs the agent runtime as a managed subprocess (the SDK pulls a platform-specific native binary via `optionalDependencies`, and that subprocess inherits the process environment). Each role can bind to a **different endpoint**, so you can mix providers (e.g. DeepSeek as Mentor, Kimi as Executor).
+Both roles are orchestrated through the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript), which runs the agent runtime as a managed subprocess (the SDK pulls a platform-specific native binary via `optionalDependencies`). Each role's subprocess receives a **minimal environment** — only that role's API key and base URL (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`) — rather than the full process environment, so other exported shell variables are not passed to it. Each role can bind to a **different endpoint**, so you can mix providers (e.g. DeepSeek as Mentor, Kimi as Executor).
 
 ## Supported Providers
 
@@ -209,19 +209,26 @@ please review our [Code of Conduct](CODE_OF_CONDUCT.md).
 > [!WARNING]
 > The **Executor is an unsandboxed coding agent.** It runs with full tools
 > (`bypassPermissions`) and can execute arbitrary shell commands, read and write
-> files, and make network requests. Its subprocess inherits your shell
-> environment, so **any secret you have exported is reachable by it** and could
-> be sent to the configured endpoint — which may be a third-party provider. Run
-> `pair-code` in a clean environment, container, or dedicated working directory
-> with only a dedicated API key exported.
+> files, and make network requests. Each role's subprocess receives a **minimal
+> environment** — only that role's API key and base URL (`ANTHROPIC_API_KEY`,
+> `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`) — not the full process
+> environment, so other secrets you have exported are not passed to it. The
+> role's API key itself, however, **is sent to the configured endpoint**, which
+> may be a third-party provider. Run `pair-code` in a clean environment,
+> container, or dedicated working directory with only a dedicated API key
+> exported.
 
 Pointing a role at the official Anthropic endpoint (base URL
 `https://api.anthropic.com`) pins `ANTHROPIC_BASE_URL` to that host for the call,
 so an ambient `ANTHROPIC_BASE_URL` in your shell won't silently redirect the key.
 
 API keys are kept in process memory unless you explicitly opt in to saving them
-(`0600`, owner-only). To report a vulnerability, see [SECURITY.md](SECURITY.md) —
-please don't open a public issue for security reports.
+(`0600`, owner-only). Saved credentials in `~/.config/pair-code/config.json` are
+also readable by the Executor agent — it runs as the same user with
+`bypassPermissions` and can `cat` the file, so the `0600` permissions only
+protect against other users, not a same-user subprocess. To report a
+vulnerability, see [SECURITY.md](SECURITY.md) — please don't open a public issue
+for security reports.
 
 ## License
 

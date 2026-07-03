@@ -2,6 +2,12 @@ import { useCallback, useMemo, useRef, useState } from 'react';
 import type { PairState, ToolEvent } from './types.js';
 import { runPairEngine, runGreetingSession, killActiveTurn, type EngineCallbacks } from './process.js';
 
+// Cap the live-text buffer to the last N chars. LiveTurn only renders the
+// final ~14 lines, so retaining the entire turn's text (up to the 10-minute
+// turn timeout) is wasted memory and GC pressure. On overflow we keep the tail
+// rather than appending unboundedly.
+const LIVE_TEXT_CAP = 8192;
+
 export interface EngineHook {
   state: PairState | null;
   liveText: string;
@@ -33,7 +39,14 @@ export function useEngine(initial: PairState | null): EngineHook {
   // keeps it stable so runWith's dependency array stays valid.
   const makeCallbacks = useCallback((): EngineCallbacks => ({
     onStateUpdate: (s) => setStateRaw(s),
-    onTextDelta: (_role, text) => { liveTextRef.current += text; },
+    onTextDelta: (_role, text) => {
+      liveTextRef.current += text;
+      // Keep only the tail once we blow past the cap — LiveTurn shows the last
+      // few lines, so older text is never visible and just wastes memory.
+      if (liveTextRef.current.length > LIVE_TEXT_CAP) {
+        liveTextRef.current = liveTextRef.current.slice(liveTextRef.current.length - LIVE_TEXT_CAP);
+      }
+    },
     onToolStart: (_role, ev) => setLiveTools(prev => [...prev, ev]),
     onToolEnd: (_role, id, status) => setLiveTools(prev => prev.map(t => t.id === id ? { ...t, status } : t)),
     onMessage: (s) => { setStateRaw(s); liveTextRef.current = ''; setLiveText(''); setLiveTools([]); },
